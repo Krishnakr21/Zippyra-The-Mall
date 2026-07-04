@@ -1,0 +1,196 @@
+name: deploy-staging
+
+on:
+  push:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.22"
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com
+  EKS_CLUSTER: pilot-zippyra
+  K8S_NAMESPACE: zippyra-pilot
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        service:
+          - auth-service
+          - store-service
+          - catalog-service
+          - cart-service
+          - payment-service
+          - order-service
+          - exit-validation-service
+          - notification-service
+          - loyalty-service
+          - inventory-service
+          - warehouse-service
+          - analytics-service
+          - support-service
+          - retailer-auth-service
+          - admin-auth-service
+          - admin-store-service
+          - chain-hq-service
+          - compliance-service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v5
+        with:
+          context: platform/services/${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/${{ matrix.service }}:staging-latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          build-args: |
+            SERVICE_NAME=${{ matrix.service }}
+
+  run-migrations:
+    name: Run DB Migrations
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install migrate CLI
+        run: |
+          curl -L https://github.com/golang-migrate/migrate/releases/download/v4.17.0/migrate.linux-amd64.tar.gz | tar xvz
+          sudo mv migrate /usr/local/bin/
+
+      - name: Get DB credentials from Secrets Manager
+        id: get-secrets
+        run: |
+          DB_URL=$(aws secretsmanager get-secret-value \
+            --secret-id pilot/zippyra/database \
+            --query SecretString \
+            --output text | jq -r '.url')
+          echo "::add-mask::$DB_URL"
+          echo "DB_URL=$DB_URL" >> $GITHUB_ENV
+
+      - name: Run migrations
+        run: |
+          migrate \
+            -path database/postgresql/migrations \
+            -database "${{ env.DB_URL }}" \
+            up
+
+  deploy:
+    name: Deploy to EKS Staging
+    runs-on: ubuntu-latest
+    needs: run-migrations
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER }}
+
+      - name: Deploy all services
+        run: |
+          # Update image tag for each service deployment
+          SERVICES=(
+            auth-service store-service catalog-service cart-service
+            payment-service order-service exit-validation-service
+            notification-service loyalty-service inventory-service
+            warehouse-service analytics-service support-service
+            retailer-auth-service admin-auth-service admin-store-service
+            chain-hq-service compliance-service
+          )
+
+          for SERVICE in "${SERVICES[@]}"; do
+            echo "Deploying $SERVICE..."
+            kubectl set image deployment/$SERVICE \
+              $SERVICE=${{ env.ECR_REGISTRY }}/$SERVICE:${{ github.sha }} \
+              -n ${{ env.K8S_NAMESPACE }}
+          done
+
+      - name: Wait for rollouts to complete
+        run: |
+          SERVICES=(
+            auth-service store-service catalog-service cart-service
+            payment-service order-service exit-validation-service
+            notification-service loyalty-service inventory-service
+            warehouse-service analytics-service support-service
+            retailer-auth-service admin-auth-service admin-store-service
+            chain-hq-service compliance-service
+          )
+
+          for SERVICE in "${SERVICES[@]}"; do
+            echo "Waiting for $SERVICE rollout..."
+            kubectl rollout status deployment/$SERVICE \
+              -n ${{ env.K8S_NAMESPACE }} \
+              --timeout=300s
+          done
+
+      - name: Run smoke tests
+        run: |
+          # Wait for services to be ready
+          sleep 30
+
+          # Get ALB endpoint
+          ALB=$(kubectl get ingress zippyra-ingress \
+            -n ${{ env.K8S_NAMESPACE }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          # Health check each critical service
+          for ENDPOINT in \
+            "http://$ALB/v1/auth/health" \
+            "http://$ALB/v1/catalog/health" \
+            "http://$ALB/v1/payment/health"; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" $ENDPOINT)
+            if [ "$STATUS" != "200" ]; then
+              echo "FAIL: $ENDPOINT returned $STATUS"
+              exit 1
+            fi
+            echo "OK: $ENDPOINT"
+          done
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Staging deployment failed for commit ${{ github.sha }}"
+          # Add Slack/PagerDuty webhook here when ready

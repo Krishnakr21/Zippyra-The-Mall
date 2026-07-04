@@ -1,0 +1,6 @@
+syntax = "proto3";
+package zippyra.cart.v1;
+option go_package = "github.com/zippyra/proto/cart/v1";
+
+// Zippyra cart service protobuf definitions.
+// Add RPC methods and message types here.

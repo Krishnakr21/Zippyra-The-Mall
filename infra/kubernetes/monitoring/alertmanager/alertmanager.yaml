@@ -1,0 +1,77 @@
+---
+# AlertManager Configuration Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+type: Opaque
+stringData:
+  alertmanager.yaml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      receiver: default
+      group_by: [alertname, service]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 1h
+      routes:
+        - match:
+            severity: critical
+          receiver: pagerduty-critical
+          repeat_interval: 1h
+        - match:
+            severity: warning
+          receiver: slack-warning
+          repeat_interval: 4h
+
+    receivers:
+      - name: default
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/slack-webhook
+            channel: "#zippyra-alerts"
+            title: "{{ .CommonLabels.alertname }}"
+            text: "{{ .CommonAnnotations.description }}"
+
+      - name: pagerduty-critical
+        pagerduty_configs:
+          - service_key_file: /etc/alertmanager/secrets/pagerduty-key
+            severity: critical
+            description: "{{ .CommonAnnotations.summary }}"
+
+      - name: slack-warning
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/slack-webhook
+            channel: "#zippyra-warnings"
+            title: "{{ .CommonLabels.alertname }}"
+            text: "{{ .CommonAnnotations.description }}"
+
+    inhibit_rules:
+      - source_match:
+          severity: critical
+        target_match:
+          severity: warning
+        equal: [alertname, service]
+
+---
+# External secrets references (create these separately with actual keys)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pagerduty-key
+  namespace: monitoring
+type: Opaque
+stringData:
+  pagerduty-key: "CHANGE_ME_pagerduty_integration_key"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slack-webhook
+  namespace: monitoring
+type: Opaque
+stringData:
+  slack-webhook: "CHANGE_ME_slack_incoming_webhook_url"

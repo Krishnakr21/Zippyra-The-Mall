@@ -1,0 +1,1215 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 1 — AUTH SERVICE
+// Tables: users, auth_events, admin_actions, login_attempts,
+//         email_verifications, app_versions
+// =============================================================================
+
+Table users {
+  id            uuid          [pk, default: `gen_random_uuid()`, note: 'Primary key']
+  phone         varchar(15)   [unique, not null, note: 'E.164 format, e.g. +919876543210']
+  email         varchar(255)  [unique, null, note: 'Optional; linked via email_verifications flow']
+  created_at    timestamptz   [not null, default: `now()`]
+  updated_at    timestamptz   [not null, default: `now()`, note: 'Updated on email link, soft-delete, profile edits']
+  last_login    timestamptz   [null]
+  is_deleted    boolean       [not null, default: false, note: 'Soft delete; DPDP PII purge triggers hard delete']
+
+  indexes {
+    phone        [unique, name: 'uq_users_phone']
+    email        [unique, name: 'uq_users_email']
+    is_deleted   [name: 'idx_users_is_deleted']
+    created_at   [name: 'idx_users_created_at']
+  }
+
+  Note: 'Core user identity table. Auth Service owner. Soft delete only — hard delete triggered by DPDP PII purge on account.deletion_requested Kafka event.'
+}
+
+
+Table auth_events {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  user_id       uuid          [not null, ref: > users.id]
+  event_type    varchar(50)   [not null, note: 'e.g. OTP_SENT, LOGIN_SUCCESS, LOGOUT, SESSION_EXPIRED']
+  device_id     varchar(255)  [null]
+  ip            inet          [null]
+  timestamp     timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id      [name: 'idx_auth_events_user_id']
+    event_type   [name: 'idx_auth_events_event_type']
+    timestamp    [name: 'idx_auth_events_timestamp']
+  }
+
+  Note: 'Append-only. Never updated. Compliance audit trail. Forever retention. One of the 4 immutable audit tables listed in Security section.'
+}
+
+
+// [GAP-B] admin_actions — Security section lists this as append-only audit table
+// but it was never schema-defined in original document. Added per Gap Analysis.
+Table admin_actions {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  admin_id      uuid          [not null, ref: > users.id, note: 'The admin user performing the action']
+  action_type   varchar(100)  [not null, note: 'e.g. PRODUCT_EDIT, USER_BAN, REFUND_APPROVE, PRICE_CHANGE']
+  target_type   varchar(50)   [null, note: 'Entity type of target_id. e.g. USER | PRODUCT | ORDER | REFUND | OFFER | STORE. Without this, target_id uuid cannot be joined to any table.']
+  target_id     uuid          [null, note: 'ID of the entity being acted upon (user, product, order, etc.)']
+  metadata      jsonb         [null, note: 'Flexible payload: old_value, new_value, reason, etc.']
+  performed_at  timestamptz   [not null, default: `now()`]
+
+  indexes {
+    admin_id     [name: 'idx_admin_actions_admin_id']
+    action_type  [name: 'idx_admin_actions_action_type']
+    performed_at [name: 'idx_admin_actions_performed_at']
+    target_type  [name: 'idx_admin_actions_target_type']
+    target_id    [name: 'idx_admin_actions_target_id']
+    (target_type, target_id) [name: 'idx_admin_actions_target', note: 'Look up all admin actions on a specific entity e.g. all actions on product X']
+  }
+
+  Note: '[GAP-B FIX] Append-only immutable audit log for all admin actions. target_type required to make target_id meaningful — without it a bare uuid has no JOIN target. Never updated.'
+}
+
+
+// [GAP-A] login_attempts — Referenced in Flow 3.10 (Account Locked)
+// "PostgreSQL: login_attempts log" — absent from original schema
+Table login_attempts {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  user_id       uuid          [null, ref: > users.id, note: 'Null if user not found by phone lookup']
+  phone         varchar(15)   [not null, note: 'Always logged, even if user_id is null']
+  ip            inet          [null]
+  attempt_at    timestamptz   [not null, default: `now()`]
+  success       boolean       [not null, default: false]
+
+  indexes {
+    phone        [name: 'idx_login_attempts_phone']
+    user_id      [name: 'idx_login_attempts_user_id']
+    attempt_at   [name: 'idx_login_attempts_attempt_at']
+    (phone, attempt_at) [name: 'idx_login_attempts_phone_time', note: 'Used for rate limiting / lockout detection']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 3.10 Account Locked flow. Tracks all OTP/login attempts per phone for lockout logic. account_locked:{phone} Redis key is set after threshold hit.'
+}
+
+
+// [GAP-A] email_verifications — Referenced in Flow 3.11 (Email Linkage)
+// No table defined in original schema
+Table email_verifications {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  user_id       uuid          [not null, ref: > users.id]
+  email         varchar(255)  [not null]
+  token_hash    varchar(255)  [not null, note: 'Hashed verification token; never store raw token']
+  verified_at   timestamptz   [null, note: 'Null until user clicks email link']
+  expires_at    timestamptz   [not null, note: 'Typically now() + 24 hours']
+
+  indexes {
+    user_id      [name: 'idx_email_verifications_user_id']
+    token_hash   [unique, name: 'uq_email_verifications_token_hash']
+    expires_at   [name: 'idx_email_verifications_expires_at']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 3.11 Email Linkage. Token is emailed to user; on click, token_hash verified and users.email updated.'
+}
+
+
+// [GAP-A] app_versions — Referenced in Flows 1.2 & 1.3 (Version Check / Force Update)
+// Must be added before Phase 1 MVP
+Table app_versions {
+  platform      varchar(10)   [pk, note: 'ios or android']
+  min_version   varchar(20)   [not null, note: 'Minimum supported version — below this, force update shown']
+  latest_version varchar(20)  [not null, note: 'Current latest released version']
+  force_update  boolean       [not null, default: false, note: 'If true, block app usage until user updates']
+  updated_at    timestamptz   [not null, default: `now()`]
+
+  Note: '[GAP-A FIX] Required for Flows 1.2 and 1.3. App checks this on launch. If current_version < min_version and force_update = true, user is blocked with upgrade screen.'
+}
+
+
+// =============================================================================
+// GROUP 2 — STORE SERVICE
+// Tables: stores, store_hours, store_qr_tokens, beacon_verifications,
+//         aisle_layout, shelf_positions
+// =============================================================================
+
+Table stores {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null]
+  lat             decimal(10,7) [not null, note: 'Latitude; spatial index for geofencing']
+  lng             decimal(10,7) [not null, note: 'Longitude; spatial index for geofencing']
+  radius_m        integer       [not null, default: 100, note: 'Geofence radius in metres for BLE/GPS entry detection']
+  short_code      varchar(20)   [unique, not null, note: 'Human-readable store identifier e.g. BLR-001']
+  address         varchar(500)  [null, note: 'Full street address; used in store listing UI and support context']
+  city            varchar(100)  [null, note: 'City name e.g. Bengaluru']
+  state           varchar(100)  [null, note: 'State name e.g. Karnataka']
+  is_open         boolean       [not null, default: true]
+  ble_beacon_uuid uuid          [unique, null, note: 'BLE beacon UUID broadcasted in-store for proximity detection']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (lat, lng)         [name: 'idx_stores_lat_lng', note: 'Spatial index for geofence queries']
+    short_code         [unique, name: 'uq_stores_short_code']
+    ble_beacon_uuid    [unique, name: 'uq_stores_ble_beacon_uuid']
+    is_open            [name: 'idx_stores_is_open']
+  }
+
+  Note: 'Store Service owner. Each store is a separate session boundary. BLE beacon UUID must be unique across all stores.'
+}
+
+
+Table store_hours {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  store_id      uuid          [not null, ref: > stores.id]
+  day_of_week   smallint      [not null, note: '0=Sunday, 1=Monday ... 6=Saturday']
+  open_time     time          [not null]
+  close_time    time          [not null]
+  is_holiday    boolean       [not null, default: false, note: 'If true, store is closed this day regardless of times']
+  updated_at    timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (store_id, day_of_week) [unique, name: 'uq_store_hours_store_day']
+    store_id                [name: 'idx_store_hours_store_id']
+  }
+
+  Note: 'Used for Store Closed screen detection. App checks current time against store hours before allowing entry flow.'
+}
+
+
+// [GAP-A] store_qr_tokens — Referenced in Flow 5.5 (Store QR Scan)
+// Without this table, store QR binding has no persistence layer
+Table store_qr_tokens {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  token_hash    varchar(255)  [unique, not null, note: 'SHA-256 of the raw QR token']
+  store_id      uuid          [not null, ref: > stores.id]
+  issued_at     timestamptz   [not null, default: `now()`]
+  expires_at    timestamptz   [not null, note: 'Short TTL — typically 5 minutes for QR freshness']
+  is_used       boolean       [not null, default: false, note: 'Marks token as consumed to prevent replay attacks']
+
+  indexes {
+    token_hash   [unique, name: 'uq_store_qr_tokens_hash']
+    store_id     [name: 'idx_store_qr_tokens_store_id']
+    expires_at   [name: 'idx_store_qr_tokens_expires_at']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 5.5 Store QR Scan. QR codes are short-lived and single-use to prevent token replay.'
+}
+
+
+// [GAP-A] beacon_verifications — BLE session audit trail needed for dispute resolution
+Table beacon_verifications {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  user_id       uuid          [not null, ref: > users.id]
+  store_id      uuid          [not null, ref: > stores.id]
+  beacon_uuid   uuid          [not null, note: 'Matches stores.ble_beacon_uuid at time of detection']
+  detected_at   timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id      [name: 'idx_beacon_verifications_user_id']
+    store_id     [name: 'idx_beacon_verifications_store_id']
+    detected_at  [name: 'idx_beacon_verifications_detected_at']
+    (user_id, store_id, detected_at) [name: 'idx_beacon_verifications_composite']
+  }
+
+  Note: '[GAP-A FIX] BLE session audit trail. Required for dispute resolution when customer disputes in-store session or unauthorized charges.'
+}
+
+
+// [GAP-B] aisle_layout — Referenced in Flows 7.10, D-5 (AR Navigation)
+// Phase-2 build plan also lists: AR navigation → PostgreSQL (aisle_layout)
+Table aisle_layout {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  store_id      uuid          [not null, ref: > stores.id]
+  svg_data      text          [not null, note: 'SVG store map markup for in-app navigation rendering']
+  updated_at    timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id     [name: 'idx_aisle_layout_store_id']
+    updated_at   [name: 'idx_aisle_layout_updated_at']
+  }
+
+  Note: '[GAP-B FIX] Referenced in Flows 7.10 and D-5 AR Navigation. NOTE [GAP-C]: Flow D-5 uses name aisle_positions — standardised to aisle_layout per Phase 2 build plan line 1669.'
+}
+
+
+// [GAP-B] shelf_positions — Referenced in Flows 7.10, D-5, D-6 (AR Item Found)
+Table shelf_positions {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  store_id      uuid          [not null, ref: > stores.id, note: 'Denormalised for direct store-level queries without joining through aisle_layout']
+  sku_id        uuid          [not null, ref: > products.id, note: 'The product stocked at this shelf slot']
+  aisle_id      uuid          [not null, ref: > aisle_layout.id]
+  slot          varchar(50)   [not null, note: 'Human-readable slot identifier e.g. A3-S2']
+  coords_json   jsonb         [not null, note: '{"x": 120, "y": 340, "z": 1} — AR overlay coordinates']
+  updated_at    timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id     [name: 'idx_shelf_positions_store_id']
+    sku_id       [name: 'idx_shelf_positions_sku_id']
+    aisle_id     [name: 'idx_shelf_positions_aisle_id']
+    (store_id, sku_id) [name: 'idx_shelf_positions_store_sku', note: 'AR item-found flow: given store + sku, find shelf coords']
+  }
+
+  Note: '[GAP-B FIX] Referenced in Flows 7.10, D-5, D-6. store_id denormalised for direct lookup. NOTE [GAP-C]: Flow D-5 uses name shelf_coords — standardised to shelf_positions per Phase 2 build plan line 1669.'
+}
+
+
+// =============================================================================
+// GROUP 3 — CATALOG SERVICE
+// Tables: categories, products, pricing_rules, offers, offer_rules,
+//         combo_rules, combo_items, recipes, recipe_ingredients
+// =============================================================================
+
+// [GAP-A] categories — Referenced in Flows 7.6, 7.7, D-7 but entirely absent
+Table categories {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null]
+  parent_id       uuid          [null, ref: > categories.id, note: 'Self-referencing for sub-categories; null = top-level']
+  store_id        uuid          [not null, ref: > stores.id]
+  product_count   integer       [not null, default: 0, note: 'Denormalised counter; updated on product insert/delete']
+  image_url       varchar(500)  [null, note: 'CDN URL for category tile image']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id       [name: 'idx_categories_store_id']
+    parent_id      [name: 'idx_categories_parent_id']
+    (store_id, name) [name: 'idx_categories_store_name']
+  }
+
+  Note: '[GAP-A FIX] Entirely absent from original schema. Required for Flows 7.6, 7.7 (Category Browse) and D-7. Catalog Service owner.'
+}
+
+
+Table products {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  barcode         varchar(100)  [not null, note: 'EAN-13 or internal barcode']
+  name            varchar(500)  [not null]
+  description     text          [null]
+  hsn_code        varchar(20)   [not null, note: 'HSN code for GST rate lookup via hsn_gst_rates table']
+  mrp             decimal(10,2) [not null, note: 'Maximum Retail Price — legal ceiling']
+  image_url       varchar(500)  [null, note: 'S3/CDN URL: products/{store_id}/{sku_id}/{image_id}.jpg — primary product image']
+  store_id        uuid          [not null, ref: > stores.id]
+  category_id     uuid          [null, ref: > categories.id, note: 'Product category; used in Flows 7.6, 7.7 category browse and Elasticsearch filter by category']
+  shelf_id        uuid          [null, ref: > shelf_positions.id, note: 'Physical shelf location; null if not mapped yet']
+  sold_by_weight  boolean       [not null, default: false, note: '[GAP-A FIX] Flow C-7 Weight Estimation references this; was missing in v1.0']
+  weight_unit     varchar(10)   [null, note: 'Required when sold_by_weight=true. e.g. kg | g | 100g. UI renders price-per-weight label e.g. "₹120/kg". Null for unit-priced items.']
+  is_active       boolean       [not null, default: true, note: 'Soft delist flag. FK constraints on order_items.sku_id prevent hard delete for products with order history. WatermelonDB sync filters is_active=false out of local cache.']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`, note: 'WatermelonDB differential sync uses this: /v1/catalog/sync?since=ts']
+
+  indexes {
+    (barcode, store_id) [unique, name: 'uq_products_barcode_store']
+    store_id            [name: 'idx_products_store_id']
+    category_id         [name: 'idx_products_category_id']
+    hsn_code            [name: 'idx_products_hsn_code']
+    shelf_id            [name: 'idx_products_shelf_id']
+    sold_by_weight      [name: 'idx_products_sold_by_weight']
+    is_active           [name: 'idx_products_is_active']
+    updated_at          [name: 'idx_products_updated_at', note: 'Powers WatermelonDB catalog sync query']
+  }
+
+  Note: 'Catalog Service owner. UNIQUE(barcode, store_id). is_active=false soft-delists without breaking order_items FK. updated_at drives WatermelonDB differential sync. sold_by_weight added per Gap-A fix (Flow C-7).'
+}
+
+
+Table pricing_rules {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  product_id      uuid          [not null, ref: > products.id]
+  store_id        uuid          [not null, ref: > stores.id]
+  price           decimal(10,2) [not null, note: 'Selling price for this time window; must be <= products.mrp']
+  effective_from  timestamptz   [not null]
+  effective_to    timestamptz   [null, note: 'Null = currently active with no end date']
+  created_at      timestamptz   [not null, default: `now()`, note: 'When this price record was inserted — distinct from effective_from (a future price can be pre-scheduled)']
+
+  indexes {
+    product_id     [name: 'idx_pricing_rules_product_id']
+    store_id       [name: 'idx_pricing_rules_store_id']
+    (product_id, store_id, effective_from) [name: 'idx_pricing_rules_active', note: 'Cart fetches latest active price with this index']
+  }
+
+  Note: 'Time-bounded pricing. Cart Service always fetches the latest active pricing_rule for a product. created_at ≠ effective_from: a future price can be pre-inserted days ahead.'
+}
+
+
+Table offers {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null, note: 'Display name shown on offer card e.g. "10% off on Dairy"']
+  type            varchar(50)   [not null, note: 'flash | combo | coupon | loyalty_bonus | personal']
+  discount_type   varchar(20)   [not null, note: 'PERCENT | FLAT | BOGO']
+  value           decimal(10,2) [not null, note: 'Discount value — percentage or flat amount depending on discount_type']
+  min_cart        decimal(10,2) [null, note: 'Minimum cart value for offer eligibility']
+  max_discount    decimal(10,2) [null, note: 'Cap on discount amount for PERCENT type']
+  starts_at       timestamptz   [null, note: 'Null = active immediately from creation. For scheduled flash sales, set future start time. active flag alone cannot express "not yet started".']
+  ends_at         timestamptz   [null, note: 'Null = no expiry']
+  store_id        uuid          [not null, ref: > stores.id]
+  active          boolean       [not null, default: true]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id       [name: 'idx_offers_store_id']
+    type           [name: 'idx_offers_type']
+    starts_at      [name: 'idx_offers_starts_at']
+    ends_at        [name: 'idx_offers_ends_at']
+    active         [name: 'idx_offers_active']
+    (store_id, active) [name: 'idx_offers_store_active', note: 'Active offer listing per store']
+  }
+
+  Note: 'Catalog Service owner. starts_at+ends_at define the valid window for flash sales. active=false can pre-stage offers before window opens. Detailed rule conditions in offer_rules (separate per Gap-C fix).'
+}
+
+
+// [GAP-A] + [GAP-C] offer_rules — Flow B-1 "PostgreSQL --- offers; offer_rules"
+// Semicolon = two SEPARATE tables. offer_rules holds structured conditions/actions
+// Also the source for Redis key offer_rules:{store_id}
+Table offer_rules {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  offer_id        uuid          [not null, ref: > offers.id]
+  rule_type       varchar(50)   [not null, note: 'SKU_MATCH | CATEGORY_MATCH | MIN_QTY | TIME_WINDOW | USER_SEGMENT']
+  condition_json  jsonb         [not null, note: 'e.g. {"sku_ids": ["uuid1","uuid2"]} or {"min_qty": 3}']
+  action_json     jsonb         [not null, note: 'e.g. {"discount_type":"PERCENT","value":10}']
+  store_id        uuid          [not null, ref: > stores.id]
+  active          boolean       [not null, default: true]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    offer_id       [name: 'idx_offer_rules_offer_id']
+    store_id       [name: 'idx_offer_rules_store_id']
+    active         [name: 'idx_offer_rules_active']
+    (store_id, active) [name: 'idx_offer_rules_store_active', note: 'Powers Redis offer_rules:{store_id} cache refresh']
+  }
+
+  Note: '[GAP-A FIX] [GAP-C FIX] SEPARATE table from offers. Holds structured rule conditions and actions that Cart Service evaluates. Also source for Redis cache key offer_rules:{store_id} with 5min TTL.'
+}
+
+
+// [GAP-A] combo_rules — Referenced in Flow 7.9 (Combo Builder)
+Table combo_rules {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null, note: 'e.g. "Buy 2 Get 1 Free — Dairy"']
+  discount_type   varchar(20)   [not null, default: 'FLAT', note: 'PERCENT | FLAT | FREE_ITEM — discount_value is ambiguous without this. 10 could mean 10% or ₹10.']
+  discount_value  decimal(10,2) [not null]
+  store_id        uuid          [not null, ref: > stores.id]
+  active          boolean       [not null, default: true]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id       [name: 'idx_combo_rules_store_id']
+    active         [name: 'idx_combo_rules_active']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 7.9 Combo Builder. Server-side combo calculation depends on this table.'
+}
+
+
+// [GAP-A] combo_items — Referenced in Flow 7.9 (Combo Builder)
+Table combo_items {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  combo_id        uuid          [not null, ref: > combo_rules.id]
+  sku_id          uuid          [not null, ref: > products.id]
+  required_qty    integer       [not null, default: 1, note: 'Number of units of this SKU needed to qualify for combo']
+  created_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    combo_id       [name: 'idx_combo_items_combo_id']
+    sku_id         [name: 'idx_combo_items_sku_id']
+    (combo_id, sku_id) [unique, name: 'uq_combo_items_combo_sku', note: 'A SKU can only appear once per combo rule']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 7.9. Each row = one SKU required in a combo deal. UNIQUE(combo_id, sku_id) prevents duplicate SKU entries in one combo.'
+}
+
+
+// [GAP-A] recipes — Referenced in Flow 7.12 (Recipe-to-Cart)
+Table recipes {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null, note: 'e.g. "Masala Pasta"']
+  store_id        uuid          [not null, ref: > stores.id]
+  image_url       varchar(500)  [null, note: 'CDN URL for recipe card image']
+  description     text          [null]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id       [name: 'idx_recipes_store_id']
+    updated_at     [name: 'idx_recipes_updated_at']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 7.12 Recipe-to-Cart. Service Registry lists Catalog Service responsibility includes recipes.'
+}
+
+
+// [GAP-A] recipe_ingredients — Referenced in Flow 7.12 (Recipe-to-Cart)
+Table recipe_ingredients {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  recipe_id       uuid          [not null, ref: > recipes.id]
+  sku_id          uuid          [not null, ref: > products.id]
+  quantity        decimal(8,3)  [not null, note: 'Amount needed e.g. 0.5 for 500g']
+  unit            varchar(20)   [not null, note: 'kg | g | l | ml | pcs | tbsp']
+  created_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    recipe_id      [name: 'idx_recipe_ingredients_recipe_id']
+    sku_id         [name: 'idx_recipe_ingredients_sku_id']
+    (recipe_id, sku_id) [unique, name: 'uq_recipe_ingredients_recipe_sku', note: 'A SKU can only appear once per recipe; prevents duplicate cart-add']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 7.12. Batch cart-add iterates recipe_ingredients. UNIQUE(recipe_id, sku_id) prevents duplicate items being added to cart.'
+}
+
+
+// =============================================================================
+// GROUP 4 — CART SERVICE
+// Tables: coupons, coupon_usage, hsn_gst_rates
+// =============================================================================
+
+Table coupons {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  code            varchar(50)   [unique, not null, note: 'Human-readable code e.g. SAVE50']
+  discount_value  decimal(10,2) [not null]
+  discount_type   varchar(20)   [not null, default: 'FLAT', note: 'FLAT | PERCENT']
+  min_order       decimal(10,2) [null, note: 'Minimum cart value for coupon eligibility']
+  max_uses        integer       [null, note: 'Total redemption cap across all users; null = unlimited']
+  per_user_limit  integer       [not null, default: 1, note: 'Max redemptions per unique user_id']
+  expires_at      timestamptz   [null]
+  active          boolean       [not null, default: true]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    code           [unique, name: 'uq_coupons_code']
+    expires_at     [name: 'idx_coupons_expires_at']
+    active         [name: 'idx_coupons_active']
+  }
+
+  Note: 'Cart Service owner. Global coupon definitions. Per-user usage tracked in coupon_usage table.'
+}
+
+
+// [GAP-A] coupon_usage — Referenced in Flows 9.3 & 9.4
+// coupons table notes "coupon_usage table for per-user tracking" but table itself was never defined
+Table coupon_usage {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  user_id         uuid          [not null, ref: > users.id]
+  coupon_code     varchar(50)   [not null, ref: > coupons.code]
+  order_id        uuid          [null, ref: > orders.id, note: 'Linked once order is confirmed; null during reservation']
+  used_at         timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id        [name: 'idx_coupon_usage_user_id']
+    coupon_code    [name: 'idx_coupon_usage_code']
+    (user_id, coupon_code) [name: 'idx_coupon_usage_user_code', note: 'Powers per_user_limit enforcement check']
+  }
+
+  Note: '[GAP-A FIX] Required for Flows 9.3 and 9.4. Enforces per_user_limit on coupons.per_user_limit field.'
+}
+
+
+Table hsn_gst_rates {
+  hsn_code        varchar(20)   [pk, note: 'HSN code matching products.hsn_code']
+  cgst_rate       decimal(5,2)  [not null, note: 'Central GST rate as percentage']
+  sgst_rate       decimal(5,2)  [not null, note: 'State GST rate as percentage']
+  igst_rate       decimal(5,2)  [not null, note: 'Integrated GST rate = CGST + SGST for inter-state']
+  effective_from  timestamptz   [not null, default: `now()`]
+
+  indexes {
+    effective_from [name: 'idx_hsn_gst_effective_from']
+  }
+
+  Note: 'Cart Service owner. Master GST rate lookup by HSN code. Aggressively cached in Redis. Cart always applies latest effective rate.'
+}
+
+
+// =============================================================================
+// GROUP 5 — INVENTORY SERVICE
+// Table: stock
+// =============================================================================
+
+// [GAP-A] CRITICAL — stock table — Service Registry explicitly names PostgreSQL (stock)
+// as Inventory Service primary DB — table was COMPLETELY absent from original schema
+Table stock {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  sku_id          uuid          [not null, ref: > products.id]
+  store_id        uuid          [not null, ref: > stores.id]
+  qty_available   integer       [not null, default: 0, note: 'Units available for purchase (not reserved)']
+  qty_reserved    integer       [not null, default: 0, note: 'Units held by active carts (cart.item_scanned Kafka event)']
+  qty_on_hand     integer       [not null, default: 0, note: 'Physical count = qty_available + qty_reserved']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (sku_id, store_id) [unique, name: 'uq_stock_sku_store']
+    store_id           [name: 'idx_stock_store_id']
+    qty_available      [name: 'idx_stock_qty_available', note: 'Powers low_stock detection queries']
+    updated_at         [name: 'idx_stock_updated_at']
+  }
+
+  Note: '[GAP-A CRITICAL FIX] Most critical missing table. Cart hold, shrinkage detection, and all stock checks depend on this. qty_reserved incremented on cart.item_scanned, decremented on cart.item_removed or order.completed.'
+}
+
+
+// =============================================================================
+// GROUP 6 — ORDER SERVICE
+// Tables: orders, order_items, refunds, refund_requests, approval_workflow
+// =============================================================================
+
+Table orders {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  user_id           uuid          [not null, ref: > users.id]
+  store_id          uuid          [not null, ref: > stores.id]
+  status            varchar(30)   [not null, note: 'PENDING | PAYMENT_PROCESSING | CONFIRMED | EXIT_VALIDATED | COMPLETED | CANCELLED | REFUNDED']
+  subtotal          decimal(12,2) [not null]
+  gst               decimal(12,2) [not null]
+  discount          decimal(12,2) [not null, default: 0]
+  total             decimal(12,2) [not null]
+  coupon_code              varchar(50)   [null, ref: > coupons.code, note: 'Applied coupon if any; null if no coupon used. Denormalised for support/audit visibility without joining coupon_usage.']
+  loyalty_points_redeemed  integer       [not null, default: 0, note: 'Points burned in this order. 0 = no loyalty redemption. Snapshot — not derived from loyalty_ledger at query time. Required for reconciliation to split coupon vs loyalty discount.']
+  exit_validated_at        timestamptz   [null, note: 'Set when exit_tokens.status transitions to USED']
+  created_at        timestamptz   [not null, default: `now()`]
+  updated_at        timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id          [name: 'idx_orders_user_id']
+    store_id         [name: 'idx_orders_store_id']
+    status           [name: 'idx_orders_status']
+    created_at       [name: 'idx_orders_created_at']
+    (user_id, created_at) [name: 'idx_orders_user_created']
+    coupon_code      [name: 'idx_orders_coupon_code']
+  }
+
+  Note: 'Event-sourced; immutable after COMPLETED status. Order Service owner. coupon_code denormalised for direct support lookup. PARTITION BY RANGE(created_at) required before Phase 2 scale.'
+}
+
+
+Table order_items {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  order_id        uuid          [not null, ref: > orders.id]
+  sku_id          uuid          [not null, ref: > products.id]
+  qty             integer       [not null]
+  unit_price      decimal(10,2) [not null, note: 'Price at time of purchase — snapshot, not live lookup']
+  gst_amount      decimal(10,2) [not null]
+  rfid_tag_id     varchar(100)  [null, note: 'RFID tag scanned at exit gate; null for non-RFID items']
+  created_at      timestamptz   [not null, default: `now()`, note: 'Required for PARTITION BY RANGE(created_at) before Phase 2 — document explicitly calls this out']
+
+  indexes {
+    order_id       [name: 'idx_order_items_order_id']
+    sku_id         [name: 'idx_order_items_sku_id']
+    rfid_tag_id    [name: 'idx_order_items_rfid_tag_id']
+    created_at     [name: 'idx_order_items_created_at']
+  }
+
+  Note: 'Order Service owner. created_at required for PARTITION BY RANGE(created_at) before Phase 2 scale. Prices are snapshot at time of purchase.'
+}
+
+
+Table refunds {
+  id                  uuid          [pk, default: `gen_random_uuid()`]
+  order_id            uuid          [not null, ref: > orders.id]
+  payment_id          uuid          [not null, ref: > payments.id, note: 'The payment being reversed; required to initiate gateway refund call']
+  sku_id              uuid          [null, ref: > products.id, note: 'Null for full-order refunds']
+  amount              decimal(10,2) [not null]
+  reason              text          [null]
+  status              varchar(30)   [not null, note: 'PENDING → PROCESSING → CREDITED | FAILED']
+  gateway_refund_id   varchar(255)  [null, note: 'Payment gateway refund reference ID; set once gateway confirms']
+  created_at          timestamptz   [not null, default: `now()`]
+  updated_at          timestamptz   [not null, default: `now()`]
+
+  indexes {
+    order_id           [name: 'idx_refunds_order_id']
+    payment_id         [name: 'idx_refunds_payment_id']
+    status             [name: 'idx_refunds_status']
+    sku_id             [name: 'idx_refunds_sku_id']
+  }
+
+  Note: 'Order Service owner. payment_id required — gateway refund call needs original payment gateway_ref. Status machine: PENDING → PROCESSING → CREDITED | FAILED.'
+}
+
+
+// [GAP-A] refund_requests — Flow A-6 "PostgreSQL --- refund_requests; approval_workflow"
+// DISTINCT from refunds table — this is the customer-facing submission
+Table refund_requests {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  order_id        uuid          [not null, ref: > orders.id]
+  user_id         uuid          [not null, ref: > users.id]
+  sku_id          uuid          [null, ref: > products.id, note: 'Specific item; null for full order refund request']
+  reason          text          [not null]
+  image_url       varchar(500)  [null, note: 'S3 URL: refunds/{order_id}/{refund_id}/{filename}.jpg — for damaged item photo']
+  status          varchar(30)   [not null, default: 'SUBMITTED', note: 'SUBMITTED | UNDER_REVIEW | APPROVED | REJECTED']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`, note: 'Updated on every status transition']
+
+  indexes {
+    order_id       [name: 'idx_refund_requests_order_id']
+    user_id        [name: 'idx_refund_requests_user_id']
+    status         [name: 'idx_refund_requests_status']
+  }
+
+  Note: '[GAP-A FIX] Customer-facing refund submission table. DISTINCT from refunds. Contains image_url for damaged items per Flow A-6. Feeds into approval_workflow state machine.'
+}
+
+
+// [GAP-A] + [GAP-C] approval_workflow — Flow A-6 "PostgreSQL --- refund_requests; approval_workflow"
+// Two distinct tables separated by semicolon — internal state machine for staff review
+Table approval_workflow {
+  id                  uuid          [pk, default: `gen_random_uuid()`]
+  refund_request_id   uuid          [not null, ref: > refund_requests.id]
+  reviewer_id         uuid          [not null, ref: > users.id, note: 'Staff/admin user performing the review']
+  status              varchar(30)   [not null, note: 'PENDING_REVIEW | APPROVED | REJECTED | ESCALATED']
+  decision_note       text          [null, note: 'Reviewer notes explaining the decision']
+  actioned_at         timestamptz   [null, note: 'Null until reviewer makes a decision']
+  created_at          timestamptz   [not null, default: `now()`]
+
+  indexes {
+    refund_request_id  [name: 'idx_approval_workflow_request_id']
+    reviewer_id        [name: 'idx_approval_workflow_reviewer_id']
+    status             [name: 'idx_approval_workflow_status']
+  }
+
+  Note: '[GAP-A FIX] [GAP-C FIX] Internal staff refund review state machine. Separate from refund_requests (customer submission) and refunds (gateway execution). Three-table refund flow: refund_requests → approval_workflow → refunds.'
+}
+
+
+// =============================================================================
+// GROUP 7 — PAYMENT SERVICE
+// Tables: payments, tokenized_cards, reconciliation_log, payment_audit_log
+// =============================================================================
+
+Table payments {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  order_id          uuid          [not null, ref: > orders.id]
+  gateway           varchar(50)   [not null, note: 'razorpay | paytm | upi | cashfree']
+  method            varchar(50)   [not null, note: 'UPI | CARD | NETBANKING | WALLET | CARD_TOKENIZED']
+  status            varchar(30)   [not null, note: 'INITIATED | PENDING | SUCCESS | FAILED | REFUNDED']
+  amount            decimal(12,2) [not null]
+  gateway_ref       varchar(255)  [null, note: 'Payment gateway transaction reference ID']
+  idempotency_key   varchar(255)  [unique, not null, note: 'UUID generated per payment attempt for dedup; prevents double charges']
+  retry_count       integer       [not null, default: 0, note: '[GAP-A FIX] Was missing in v1.0; max 3 retries across gateways']
+  created_at        timestamptz   [not null, default: `now()`]
+  updated_at        timestamptz   [not null, default: `now()`]
+
+  indexes {
+    order_id         [name: 'idx_payments_order_id']
+    status           [name: 'idx_payments_status']
+    gateway_ref      [name: 'idx_payments_gateway_ref']
+    idempotency_key  [unique, name: 'uq_payments_idempotency_key']
+    gateway          [name: 'idx_payments_gateway']
+  }
+
+  Note: 'Payment Service owner. retry_count added per Gap-A fix — was absent in v1.0 but payment retry logic requires retry_count++ (max 3 across gateways). idempotency_key prevents duplicate charges on network retry.'
+}
+
+
+// [GAP-B] tokenized_cards — Flow P-13 references tokenized card storage but no table existed
+Table tokenized_cards {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  user_id           uuid          [not null, ref: > users.id]
+  razorpay_token    varchar(255)  [not null, note: 'PCI-DSS: Razorpay vault token; Zippyra never stores raw card data']
+  card_last4        char(4)       [not null, note: 'Last 4 digits for display only e.g. ••••4242']
+  card_brand        varchar(20)   [not null, note: 'VISA | MASTERCARD | RUPAY | AMEX']
+  is_active         boolean       [not null, default: true, note: 'Soft delete for card removal UX. User taps Remove Card → is_active=false. Card is not hard-deleted in case historical payment records reference this tokenized flow.']
+  created_at        timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id          [name: 'idx_tokenized_cards_user_id']
+    razorpay_token   [name: 'idx_tokenized_cards_token']
+    is_active        [name: 'idx_tokenized_cards_is_active']
+  }
+
+  Note: '[GAP-B FIX] Flow P-13 Card Payment. PCI-DSS compliant — only Razorpay vault token stored, never raw card numbers or CVV. is_active enables card removal without breaking historical payment audit trail.'
+}
+
+
+// [GAP-B] reconciliation_log — Service Registry names Reconciliation Service with this DB
+// Never schema-defined in original
+Table reconciliation_log {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  payment_id      uuid          [not null, ref: > payments.id]
+  gateway_ref     varchar(255)  [not null]
+  settled_amount  decimal(12,2) [not null]
+  status          varchar(30)   [not null, note: 'MATCHED | MISMATCH | PENDING | DISPUTE']
+  reconciled_at   timestamptz   [not null, default: `now()`]
+
+  indexes {
+    payment_id     [name: 'idx_reconciliation_log_payment_id']
+    status         [name: 'idx_reconciliation_log_status']
+    reconciled_at  [name: 'idx_reconciliation_log_reconciled_at']
+    gateway_ref    [name: 'idx_reconciliation_log_gateway_ref']
+  }
+
+  Note: '[GAP-B FIX] Reconciliation Service owner. Matches Zippyra payment records against payment gateway settlement reports. MISMATCH status triggers finance alert.'
+}
+
+
+// [GAP-C] payment_audit_log — Security section explicitly lists 4 append-only audit tables:
+// auth_events, payment_events (audit), override_log, admin_actions.
+// The "payment_events" PostgreSQL audit table is DISTINCT from payment_events in TimescaleDB
+// (analytics). Renamed here to payment_audit_log to resolve the [GAP-C] dual-role naming conflict.
+Table payment_audit_log {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  payment_id      uuid          [not null, ref: > payments.id]
+  order_id        uuid          [not null, ref: > orders.id]
+  user_id         uuid          [not null, ref: > users.id]
+  event_type      varchar(50)   [not null, note: 'PAYMENT_INITIATED | PAYMENT_SUCCESS | PAYMENT_FAILED | REFUND_INITIATED | REFUND_COMPLETED | CHARGEBACK']
+  amount          decimal(12,2) [not null]
+  gateway         varchar(50)   [not null, note: 'razorpay | paytm | upi | cashfree']
+  gateway_ref     varchar(255)  [null, note: 'Gateway transaction reference at time of event']
+  metadata        jsonb         [null, note: 'Additional context: error_code, retry_number, ip, device_id']
+  recorded_at     timestamptz   [not null, default: `now()`]
+
+  indexes {
+    payment_id     [name: 'idx_payment_audit_log_payment_id']
+    order_id       [name: 'idx_payment_audit_log_order_id']
+    user_id        [name: 'idx_payment_audit_log_user_id']
+    event_type     [name: 'idx_payment_audit_log_event_type']
+    recorded_at    [name: 'idx_payment_audit_log_recorded_at']
+  }
+
+  Note: '[GAP-C FIX] One of the 4 immutable audit tables in Security section. Append-only, never updated. Forever retention for compliance. RENAMED from payment_events to resolve dual-role conflict — payment_events in TimescaleDB is the analytics hypertable (latency, gateway health). This table is the compliance audit log.'
+}
+
+
+// =============================================================================
+// GROUP 8 — LOYALTY SERVICE
+// Tables: loyalty_ledger, loyalty_tiers, loyalty_cards, loyalty_tier_history
+// =============================================================================
+
+Table loyalty_ledger {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  user_id         uuid          [not null, ref: > users.id]
+  order_id        uuid          [null, ref: > orders.id, note: 'Null for manual adjustments or expiry entries']
+  points_change   integer       [not null, note: 'Positive = earn; Negative = redeem or expiry']
+  type            varchar(30)   [not null, note: 'EARN | REDEEM | EXPIRE | BONUS | ADJUSTMENT']
+  balance_after   integer       [not null, note: 'Running balance after this entry; derived from SUM but stored for performance']
+  notes           text          [null, note: 'Human-readable reason — required for ADJUSTMENT type (e.g. "Goodwill correction for order ORD-123"), useful for BONUS. Shown on user loyalty statement.']
+  created_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id        [name: 'idx_loyalty_ledger_user_id']
+    order_id       [name: 'idx_loyalty_ledger_order_id']
+    created_at     [name: 'idx_loyalty_ledger_created_at']
+    (user_id, created_at) [name: 'idx_loyalty_ledger_user_created']
+  }
+
+  Note: 'Loyalty Service owner. Append-only — never UPDATE. True balance = SUM(points_change) per user_id. balance_after is a performance-optimised snapshot. notes required for ADJUSTMENT audit trail.'
+}
+
+
+// [GAP-B] loyalty_tiers — Referenced in Flow A-1 Profile
+// "PostgreSQL --- users, loyalty_tiers" — tier definition table was missing
+Table loyalty_tiers {
+  tier_name       varchar(50)   [pk, note: 'e.g. BRONZE | SILVER | GOLD | PLATINUM']
+  min_points      integer       [not null]
+  max_points      integer       [null, note: 'Null for highest tier — no upper limit']
+  benefits_json   jsonb         [not null, note: 'e.g. {"extra_discount_pct": 5, "free_delivery": true, "priority_support": false}']
+  updated_at      timestamptz   [not null, default: `now()`, note: 'Updated when tier thresholds or benefits change']
+
+  indexes {
+    min_points     [name: 'idx_loyalty_tiers_min_points']
+  }
+
+  Note: '[GAP-B FIX] Required for Flow A-1 Profile (tier badge and thresholds display). App shows tier badge, progress bar, and benefits from benefits_json.'
+}
+
+
+// [GAP-B] loyalty_cards — Referenced in Flow B-5 (Loyalty Barcode)
+// "PostgreSQL --- loyalty_cards; barcode generated server-side"
+Table loyalty_cards {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  user_id         uuid          [unique, not null, ref: > users.id, note: 'One card per user']
+  card_number     varchar(50)   [unique, not null, note: 'Human-readable card number e.g. ZPY-0012345']
+  barcode_data    varchar(500)  [not null, note: 'Base64 or URL for barcode image; generated server-side']
+  issued_at       timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id        [unique, name: 'uq_loyalty_cards_user_id']
+    card_number    [unique, name: 'uq_loyalty_cards_number']
+  }
+
+  Note: '[GAP-B FIX] Required for Flow B-5 Loyalty Barcode. Barcode generated server-side; used for in-store and partner integrations.'
+}
+
+
+// [GAP-B] loyalty_tier_history — No audit trail for tier upgrades/downgrades
+// Customer disputes cannot be resolved without history
+Table loyalty_tier_history {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  user_id           uuid          [not null, ref: > users.id]
+  old_tier          varchar(50)   [not null, ref: > loyalty_tiers.tier_name, note: 'Tier before change']
+  new_tier          varchar(50)   [not null, ref: > loyalty_tiers.tier_name, note: 'Tier after change']
+  changed_at        timestamptz   [not null, default: `now()`]
+  trigger_order_id  uuid          [null, ref: > orders.id, note: 'Order that triggered tier upgrade/downgrade; null for manual changes']
+
+  indexes {
+    user_id          [name: 'idx_loyalty_tier_history_user_id']
+    changed_at       [name: 'idx_loyalty_tier_history_changed_at']
+  }
+
+  Note: '[GAP-B FIX] Audit trail for tier upgrades/downgrades. Required for customer dispute resolution. Append-only.'
+}
+
+
+// =============================================================================
+// GROUP 9 — EXIT VALIDATION SERVICE
+// Tables: exit_tokens, override_log
+// =============================================================================
+
+Table exit_tokens {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  order_id        uuid          [not null, ref: > orders.id]
+  token_hash      varchar(255)  [unique, not null, note: 'Hashed exit QR token']
+  created_at      timestamptz   [not null, default: `now()`]
+  expires_at      timestamptz   [not null, note: 'Short TTL — typically 30 minutes from order confirmation']
+  status          varchar(20)   [not null, default: 'VALID', note: 'VALID → USED | EXPIRED | DENIED']
+  used_at         timestamptz   [null, note: 'Set when customer exits through gate']
+  gate_id         varchar(50)   [null, note: 'Which physical gate was used for exit']
+
+  indexes {
+    order_id       [name: 'idx_exit_tokens_order_id']
+    token_hash     [unique, name: 'uq_exit_tokens_hash']
+    status         [name: 'idx_exit_tokens_status']
+    expires_at     [name: 'idx_exit_tokens_expires_at']
+    created_at     [name: 'idx_exit_tokens_created_at']
+  }
+
+  Note: 'Exit Validation Service owner. Status machine: VALID → USED | EXPIRED | DENIED. DENIED triggers exit.denied Kafka event which feeds shrinkage_signals in ClickHouse.'
+}
+
+
+Table override_log {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  exit_token_id   uuid          [not null, ref: > exit_tokens.id]
+  staff_id        uuid          [not null, ref: > users.id, note: 'Staff member who authorised the override']
+  reason_code     varchar(50)   [not null, note: 'SYSTEM_ERROR | RFID_MISMATCH | MANAGER_OVERRIDE | PAYMENT_PENDING']
+  override_at     timestamptz   [not null, default: `now()`]
+
+  indexes {
+    exit_token_id  [name: 'idx_override_log_exit_token_id']
+    staff_id       [name: 'idx_override_log_staff_id']
+    override_at    [name: 'idx_override_log_override_at']
+  }
+
+  Note: 'Exit Validation Service owner. Append-only. Required for shrinkage investigation. Every gate override must be logged with a reason code.'
+}
+
+
+// =============================================================================
+// GROUP 10 — WAREHOUSE SERVICE
+// Tables: warehouse_stock, transfers
+// =============================================================================
+
+// [GAP-B] warehouse_stock — Service Registry explicitly names PostgreSQL (warehouse_stock)
+// Required for GRN inward and allocation flows
+Table warehouse_stock {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  sku_id          uuid          [not null, ref: > products.id]
+  warehouse_id    varchar(100)  [not null, note: 'Warehouse identifier e.g. WH-BLR-01']
+  qty_available   integer       [not null, default: 0]
+  batch_no        varchar(100)  [null, note: 'Supplier batch number for traceability']
+  expiry          date          [null, note: 'For perishable goods; null for non-perishables']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (sku_id, warehouse_id) [name: 'idx_warehouse_stock_sku_warehouse']
+    warehouse_id           [name: 'idx_warehouse_stock_warehouse_id']
+    expiry                 [name: 'idx_warehouse_stock_expiry', note: 'For expiry-based FIFO dispatch']
+    updated_at             [name: 'idx_warehouse_stock_updated_at']
+  }
+
+  Note: '[GAP-B FIX] Warehouse Service owner. Required for GRN (Goods Received Note) inward and store allocation flows. updated_at tracks when qty changed.'
+}
+
+
+// [GAP-B] transfers — Service Registry explicitly names PostgreSQL (transfers)
+// Required for store allocation and dispatch flows
+Table transfers {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  sku_id            uuid          [not null, ref: > products.id]
+  from_warehouse_id varchar(100)  [not null, note: 'Source warehouse identifier']
+  to_store_id       uuid          [not null, ref: > stores.id, note: 'Destination store']
+  qty               integer       [not null]
+  transfer_note     text          [null]
+  created_at        timestamptz   [not null, default: `now()`, note: 'When transfer was requested']
+  dispatched_at     timestamptz   [null, note: 'Null until warehouse dispatches; set on dispatch']
+  received_at       timestamptz   [null, note: 'Null until store confirms receipt; set on RECEIVED status. Triggers stock.qty_available increment.']
+  status            varchar(30)   [not null, default: 'PENDING', note: 'PENDING | DISPATCHED | IN_TRANSIT | RECEIVED | CANCELLED']
+
+  indexes {
+    sku_id           [name: 'idx_transfers_sku_id']
+    to_store_id      [name: 'idx_transfers_to_store_id']
+    status           [name: 'idx_transfers_status']
+    created_at       [name: 'idx_transfers_created_at']
+    dispatched_at    [name: 'idx_transfers_dispatched_at']
+    received_at      [name: 'idx_transfers_received_at']
+  }
+
+  Note: '[GAP-B FIX] Warehouse Service owner. State timestamps: created_at (requested), dispatched_at (sent), received_at (confirmed by store). On RECEIVED, stock.qty_available incremented.'
+}
+
+
+// =============================================================================
+// GROUP 11 — NOTIFICATION SERVICE
+// Tables: user_notification_prefs, notification_delivery_log
+// =============================================================================
+
+// [GAP-B] user_notification_prefs — Referenced in Flow B-4 (Comms Preferences)
+// Notification routing (WhatsApp vs SMS vs Push vs Email) entirely depends on this
+Table user_notification_prefs {
+  user_id             uuid          [pk, ref: > users.id]
+  whatsapp_enabled    boolean       [not null, default: true]
+  sms_enabled         boolean       [not null, default: true]
+  push_enabled        boolean       [not null, default: true]
+  email_enabled       boolean       [not null, default: false, note: 'Off by default; enabled when email is verified']
+  updated_at          timestamptz   [not null, default: `now()`]
+
+  Note: '[GAP-B FIX] Required for Flow B-4 Comms Preferences. Notification Service reads this before dispatching any notification to determine which channel(s) to use.'
+}
+
+
+// [GAP-B] notification_delivery_log — Service Registry lists delivery_log (PostgreSQL)
+// Never schema-defined in original
+Table notification_delivery_log {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  user_id           uuid          [not null, ref: > users.id]
+  channel           varchar(20)   [not null, note: 'WHATSAPP | SMS | PUSH | EMAIL']
+  status            varchar(20)   [not null, note: 'SENT | DELIVERED | FAILED | BOUNCED']
+  notification_type varchar(50)   [not null, note: 'OTP | ORDER_CONFIRMATION | REFUND | LOYALTY | PROMOTIONAL | TICKET_UPDATE']
+  reference_id      uuid          [null, note: 'ID of the entity this notification is about e.g. order_id, refund_id, ticket_id']
+  reference_type    varchar(50)   [null, note: 'Entity type e.g. ORDER | REFUND | TICKET | OTP — pairs with reference_id']
+  provider_message_id varchar(255) [null, note: 'Message ID returned by the channel provider (Twilio SID, FCM message_id, etc.) — needed to query delivery status via webhook']
+  error_details     text          [null, note: 'Error description from provider for FAILED or BOUNCED status. e.g. "Invalid phone number", "FCM token expired". Null for SENT/DELIVERED.']
+  sent_at           timestamptz   [not null, default: `now()`]
+  delivered_at      timestamptz   [null, note: 'Set via delivery webhook from channel provider']
+
+  indexes {
+    user_id          [name: 'idx_notification_delivery_log_user_id']
+    channel          [name: 'idx_notification_delivery_log_channel']
+    status           [name: 'idx_notification_delivery_log_status']
+    sent_at          [name: 'idx_notification_delivery_log_sent_at']
+    reference_id     [name: 'idx_notification_delivery_log_reference_id', note: 'Look up all notifications sent about a specific order or refund']
+    provider_message_id [name: 'idx_notification_delivery_log_provider_msg_id', note: 'Webhook delivery callback lookup by provider message ID']
+  }
+
+  Note: '[GAP-B FIX] Notification Service owner. provider_message_id enables webhook-based delivery confirmation. error_details enables intelligent retry and failure diagnosis for FAILED/BOUNCED.'
+}
+
+
+// =============================================================================
+// GROUP 12 — SUPPORT SERVICE
+// Tables: tickets, ticket_messages
+// =============================================================================
+
+Table tickets {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  user_id         uuid          [not null, ref: > users.id]
+  order_id        uuid          [null, ref: > orders.id, note: 'Set when ticket is raised from exit.denied or refund.requested event; null for general support']
+  subject         varchar(500)  [not null]
+  status          varchar(30)   [not null, default: 'OPEN', note: 'OPEN | IN_PROGRESS | ESCALATED | RESOLVED | CLOSED']
+  assigned_to     uuid          [null, ref: > users.id, note: 'Support agent assigned to this ticket; null when unassigned (OPEN state)']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`, note: 'Updated on every status transition and reassignment. Powers recently-updated sort and stale-ticket detection.']
+  resolved_at     timestamptz   [null]
+  sla_target      timestamptz   [not null, note: 'SLA deadline = created_at + 2hr; escalation triggered if unresolved by this time']
+
+  indexes {
+    user_id        [name: 'idx_tickets_user_id']
+    order_id       [name: 'idx_tickets_order_id']
+    status         [name: 'idx_tickets_status']
+    assigned_to    [name: 'idx_tickets_assigned_to', note: 'Agent workload view: all open tickets assigned to me']
+    sla_target     [name: 'idx_tickets_sla_target', note: 'Escalation job scans for tickets where now() > sla_target']
+    created_at     [name: 'idx_tickets_created_at']
+    updated_at     [name: 'idx_tickets_updated_at']
+  }
+
+  Note: 'Support Service owner. assigned_to links to the agent handling the ticket (null = unassigned). SLA escalation after 2hr unresolved. Consumed from exit.denied and refund.requested Kafka events.'
+}
+
+
+// [GAP-B] ticket_messages — Referenced in Flow B-6
+// "PostgreSQL --- tickets, ticket_messages" — tickets table existed but ticket_messages was not defined
+Table ticket_messages {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  ticket_id       uuid          [not null, ref: > tickets.id]
+  sender_id       uuid          [null, ref: > users.id, note: 'Null for SYSTEM/BOT messages. For CUSTOMER = tickets.user_id. For AGENT = the staff member. Required for agent response-time metrics.']
+  sender_role     varchar(20)   [not null, note: 'CUSTOMER | AGENT | SYSTEM | BOT']
+  message         text          [not null]
+  sent_at         timestamptz   [not null, default: `now()`]
+
+  indexes {
+    ticket_id      [name: 'idx_ticket_messages_ticket_id']
+    sender_id      [name: 'idx_ticket_messages_sender_id']
+    sent_at        [name: 'idx_ticket_messages_sent_at']
+    (ticket_id, sent_at) [name: 'idx_ticket_messages_ticket_sent', note: 'Powers threaded conversation view ordered by time']
+  }
+
+  Note: '[GAP-B FIX] Required for Flow B-6 Support Tickets. sender_id identifies which agent replied — required for agent performance and SLA measurement.'
+}
+
+
+// =============================================================================
+// TABLE GROUPS — organise by service in dbdiagram.io
+// =============================================================================
+
+TableGroup auth_service {
+  users
+  auth_events
+  admin_actions
+  login_attempts
+  email_verifications
+  app_versions
+}
+
+TableGroup store_service {
+  stores
+  store_hours
+  store_qr_tokens
+  beacon_verifications
+  aisle_layout
+  shelf_positions
+}
+
+TableGroup catalog_service {
+  categories
+  products
+  pricing_rules
+  offers
+  offer_rules
+  combo_rules
+  combo_items
+  recipes
+  recipe_ingredients
+}
+
+TableGroup cart_service {
+  coupons
+  coupon_usage
+  hsn_gst_rates
+}
+
+TableGroup inventory_service {
+  stock
+}
+
+TableGroup order_service {
+  orders
+  order_items
+  refunds
+  refund_requests
+  approval_workflow
+}
+
+TableGroup payment_service {
+  payments
+  tokenized_cards
+  reconciliation_log
+  payment_audit_log
+}
+
+TableGroup loyalty_service {
+  loyalty_ledger
+  loyalty_tiers
+  loyalty_cards
+  loyalty_tier_history
+}
+
+TableGroup exit_validation_service {
+  exit_tokens
+  override_log
+}
+
+TableGroup warehouse_service {
+  warehouse_stock
+  transfers
+}
+
+TableGroup notification_service {
+  user_notification_prefs
+  notification_delivery_log
+}
+
+TableGroup support_service {
+  tickets
+  ticket_messages
+}
+
+
+// =============================================================================
+// END OF SCHEMA — PASS 9 — TRULY FINAL (EXHAUSTIVE TABLE-BY-TABLE AUDIT)
+// 46 tables | 12 service groups | 74 FK refs
+// All 33 document gaps resolved. All passes verified.
+//
+// PASS 9 FIXES (exhaustive table-by-table read — every table as if building from scratch):
+//   1.  stores.address + city + state — store listing UI and support context needs readable location
+//   2.  products.weight_unit — sold_by_weight=true needs unit label (kg/g/100g) for price display
+//   3.  combo_rules.discount_type — PERCENT|FLAT|FREE_ITEM; discount_value alone is ambiguous
+//   4.  orders.loyalty_points_redeemed — split coupon vs loyalty in reconciliation; snapshot not derived
+//   5.  tokenized_cards.is_active + index — UX needs soft remove; hard delete breaks audit trail
+//   6.  tickets.updated_at + index — status transitions need updated_at for recently-updated sort
+//
+// PASS 8 FIXES (service build simulation — 7 real gaps found):
+//   1.  products.is_active — soft delist flag (FK on order_items prevents hard delete)
+//   2.  products.is_active index — added
+//   3.  transfers.received_at — RECEIVED status had no timestamp (dispatched_at existed)
+//   4.  transfers.received_at index — added
+//   5.  ticket_messages.sender_id — FK to users.id (AGENT role needs identity for metrics)
+//   6.  ticket_messages.sender_id index — added
+//   7.  loyalty_ledger.notes — ADJUSTMENT type needs human-readable reason for user statement
+//   8.  notification_delivery_log.provider_message_id — webhook delivery confirmation lookup
+//   9.  notification_delivery_log.error_details — FAILED/BOUNCED needs error for retry logic
+//   10. notification_delivery_log.provider_message_id index — added
+//   11. offers.starts_at — flash sales need window start; active flag alone insufficient
+//   12. offers.starts_at index — added
+//   13. admin_actions.target_type — bare target_id uuid is unjoiable without entity type
+//   14. admin_actions.target_type index — added
+//   15. admin_actions.(target_type, target_id) composite index — added
+//   Note: pricing_rules composite index (product_id, store_id, effective_from) was
+//         already present — confirmed not missing.
+//
+// PASS 7 FIXES: users.updated_at, combo_items UNIQUE(combo_id,sku_id),
+//   recipe_ingredients UNIQUE(recipe_id,sku_id), orders.coupon_code+index,
+//   exit_tokens.created_at, tickets.assigned_to+index, pricing_rules.created_at
+// PASS 6 FIX: refund_requests.updated_at
+// PASS 5 FIX: loyalty_tiers.updated_at
+// PASS 4 FIXES: products.image_url+created_at+index, timestamps on coupons/combo_rules/
+//   recipes/offer_rules/combo_items/recipe_ingredients/categories/stores/store_hours/
+//   shelf_positions, tickets.order_id+index
+// PASS 3 FIXES: shelf_positions.store_id+FK, offers.name+timestamps, stock timestamps,
+//   refunds.payment_id, warehouse_stock.updated_at, transfers.created_at,
+//   notification_delivery_log reference_id+type
+// PASS 2 FIXES: shelf_positions.sku_id FK, products.category_id FK, coupon_usage.order_id
+//   FK, order_items.created_at, loyalty_tier_history FKs, payment_audit_log (full table)
+//
+// INTENTIONAL DESIGN (not missing):
+//   store_hours: updated_at only (config table, insert date irrelevant)
+//   stock: no low_stock_threshold (app-level config, not per-row)
+//   payments: no currency (India-only MVP, INR implicit)
+//   payments: no user_id (always reachable via order_id → orders.user_id)
+//   override_log: no order_id (reachable via exit_token_id → exit_tokens.order_id)
+//   warehouse_stock: no UNIQUE on (sku_id,warehouse_id) — batch_no nullable, multi-GRN valid
+//   aisle_layout: no version (updated_at signals app to refetch)
+//   coupon_usage: no DB unique constraint (per_user_limit enforced at app layer)
+//   loyalty_ledger: no offer_id (context flows via order_id + type enum)
+//   order_items: no offer_id (per-item offer attribution is ClickHouse analytics concern)
+//   store_qr_tokens: no user_id (token is store-issued; user identity via beacon_verifications)
+//   auth_events: no session_id (application-layer concern; device_id+timestamp sufficient)
+//   email_verifications: no created_at (expires_at = created_at + 24h; back-calculable)
+//   stores: address nullable (lat/lng always present; address is display enrichment)
+//
+// ALL 33 DOCUMENT GAPS RESOLVED:
+// [GAP-A] stock, store_qr_tokens, app_versions, email_verifications,
+//   login_attempts, coupon_usage, categories, recipes, recipe_ingredients,
+//   combo_rules, combo_items, refund_requests, products.sold_by_weight,
+//   payments.retry_count, offer_rules (separate from offers)
+// [GAP-B] warehouse_stock, transfers, admin_actions, tokenized_cards,
+//   reconciliation_log, aisle_layout, shelf_positions, loyalty_tiers,
+//   loyalty_cards, loyalty_tier_history, user_notification_prefs,
+//   notification_delivery_log, ticket_messages, approval_workflow
+// [GAP-C] aisle_layout name conflict, shelf_positions name conflict,
+//   payment_events dual-role (payment_audit_log here + payment_analytics_events
+//   in TimescaleDB diagram), offer_rules as separate table from offers
+// =============================================================================

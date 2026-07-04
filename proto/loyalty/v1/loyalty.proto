@@ -1,0 +1,6 @@
+syntax = "proto3";
+package zippyra.loyalty.v1;
+option go_package = "github.com/zippyra/proto/loyalty/v1";
+
+// Zippyra loyalty service protobuf definitions.
+// Add RPC methods and message types here.

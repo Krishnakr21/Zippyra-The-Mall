@@ -1,0 +1,72 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 4 — CART SERVICE
+// Tables: coupons, coupon_usage, hsn_gst_rates
+// =============================================================================
+
+Table coupons {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  code            varchar(50)   [unique, not null, note: 'Human-readable code e.g. SAVE50']
+  discount_value  decimal(10,2) [not null]
+  discount_type   varchar(20)   [not null, default: 'FLAT', note: 'FLAT | PERCENT']
+  min_order       decimal(10,2) [null, note: 'Minimum cart value for coupon eligibility']
+  max_uses        integer       [null, note: 'Total redemption cap across all users; null = unlimited']
+  per_user_limit  integer       [not null, default: 1, note: 'Max redemptions per unique user_id']
+  expires_at      timestamptz   [null]
+  active          boolean       [not null, default: true]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    code           [unique, name: 'uq_coupons_code']
+    expires_at     [name: 'idx_coupons_expires_at']
+    active         [name: 'idx_coupons_active']
+  }
+
+  Note: 'Cart Service owner. Global coupon definitions. Per-user usage tracked in coupon_usage table.'
+}
+
+
+// [GAP-A] coupon_usage — Referenced in Flows 9.3 & 9.4
+// coupons table notes "coupon_usage table for per-user tracking" but table itself was never defined
+Table coupon_usage {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  user_id         uuid          [not null, ref: > users.id]
+  coupon_code     varchar(50)   [not null, ref: > coupons.code]
+  order_id        uuid          [null, ref: > orders.id, note: 'Linked once order is confirmed; null during reservation']
+  used_at         timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id        [name: 'idx_coupon_usage_user_id']
+    coupon_code    [name: 'idx_coupon_usage_code']
+    (user_id, coupon_code) [name: 'idx_coupon_usage_user_code', note: 'Powers per_user_limit enforcement check']
+  }
+
+  Note: '[GAP-A FIX] Required for Flows 9.3 and 9.4. Enforces per_user_limit on coupons.per_user_limit field.'
+}
+
+
+Table hsn_gst_rates {
+  hsn_code        varchar(20)   [pk, note: 'HSN code matching products.hsn_code']
+  cgst_rate       decimal(5,2)  [not null, note: 'Central GST rate as percentage']
+  sgst_rate       decimal(5,2)  [not null, note: 'State GST rate as percentage']
+  igst_rate       decimal(5,2)  [not null, note: 'Integrated GST rate = CGST + SGST for inter-state']
+  effective_from  timestamptz   [not null, default: `now()`]
+
+  indexes {
+    effective_from [name: 'idx_hsn_gst_effective_from']
+  }
+
+  Note: 'Cart Service owner. Master GST rate lookup by HSN code. Aggressively cached in Redis. Cart always applies latest effective rate.'
+}
+
+
+// =============================================================================

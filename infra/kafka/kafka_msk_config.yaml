@@ -1,0 +1,583 @@
+# =============================================================================
+# ZIPPYRA — Amazon MSK (Kafka) Cluster Configuration
+# 100M customer scale | ap-south-1 Mumbai primary
+# Version 1.0 | March 2026 | Confidential
+#
+# Broker sizing rule: 1 broker per 50K msgs/sec sustained throughput
+# At 100M users peak = ~14K msgs/sec → 12 brokers with 40% headroom
+# =============================================================================
+
+msk_cluster:
+  cluster_name: zippyra-kafka-prod
+  kafka_version: "3.6.0"
+  region: ap-south-1
+  availability_zones: [ap-south-1a, ap-south-1b, ap-south-1c]
+
+  broker_node_group:
+    instance_type: kafka.m5.4xlarge      # 16 vCPU | 64 GB RAM
+    number_of_broker_nodes: 12           # 4 per AZ — always multiple of AZ count
+    storage_per_broker_gb: 8000          # 8 TB NVMe per broker
+    storage_autoscaling:
+      enabled: true
+      max_gb: 16000
+      target_utilization_pct: 70
+
+  encryption:
+    in_transit: TLS                      # mTLS between brokers + clients
+    at_rest: AWS_OWNED_KMS
+
+  authentication:
+    sasl_scram: true                     # username/password per service
+    iam: true                            # IAM roles for EKS service accounts
+
+  # ── Broker-level kafka configs ──────────────────────────────────────────
+  broker_config:
+    # Retention: broker default (overridden per topic where needed)
+    log.retention.hours: 168             # 7 days default
+    log.retention.bytes: -1              # unlimited bytes (use time-based)
+    log.segment.bytes: 536870912         # 512 MB segments
+
+    # Replication
+    default.replication.factor: 3
+    min.insync.replicas: 2               # writes ACK only after 2 replicas confirm
+    unclean.leader.election.enable: false # NEVER allow data loss for leadership
+
+    # Performance
+    num.network.threads: 8
+    num.io.threads: 16
+    num.replica.fetchers: 4
+    replica.fetch.max.bytes: 10485760    # 10 MB
+    message.max.bytes: 10485760          # 10 MB max message size
+
+    # Producer safety
+    enable.idempotence: true             # exactly-once producer semantics
+    acks: all                            # wait for all ISR replicas
+
+    # Consumer
+    auto.offset.reset: earliest          # new consumer groups start from beginning
+    enable.auto.commit: false            # manual offset commit — never lose events
+
+    # Tiered storage (for long-retention compliance topics)
+    remote.log.storage.enable: true      # MSK Tiered Storage → S3
+    log.local.retention.bytes: 1073741824 # keep 1GB locally, rest in S3
+
+  # ── Monitoring ────────────────────────────────────────────────────────
+  monitoring:
+    enhanced_monitoring: PER_TOPIC_PER_BROKER
+    prometheus_jmx_exporter: true
+    cloudwatch_metrics: true
+
+  alerts:
+    - metric: KafkaDataLogsDiskUsed > 70%
+      severity: P1
+      action: "Trigger storage autoscaling. Investigate high-volume topics."
+    - metric: ConsumerLag > topic_max_lag (per ConsumerGroup registry)
+      severity: P1
+      action: "Scale consumer service pods. Check for processing errors."
+    - metric: UnderReplicatedPartitions > 0
+      severity: P1
+      action: "Broker node issue. Check broker health immediately."
+    - metric: ActiveControllerCount != 1
+      severity: P0
+      action: "Split-brain risk. Page on-call SRE immediately."
+    - metric: OfflinePartitionsCount > 0
+      severity: P0
+      action: "Data unavailable. Immediate escalation."
+    - metric: NetworkRxDrops or NetworkTxDrops > 0
+      severity: P2
+      action: "Network saturation. Check broker NIC throughput."
+
+# =============================================================================
+# TOPIC CONFIGURATIONS
+# Groups by volume tier for readability
+# All topics: replication.factor=3, min.insync.replicas=2
+# =============================================================================
+
+topics:
+
+  # ── TIER 1: CRITICAL PATH — payment + order + exit ──────────────────────
+  # Wrong partition count here = payment confirmation delays
+
+  - name: payment.confirmed
+    partitions: 128
+    replication_factor: 3
+    retention_ms: 2592000000            # 30 days
+    partition_key: user_id
+    compression: lz4
+    config:
+      min.insync.replicas: "2"
+      unclean.leader.election.enable: "false"
+
+  - name: payment.initiated
+    partitions: 128
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: user_id
+    compression: lz4
+
+  - name: payment.failed
+    partitions: 64
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: user_id
+    compression: lz4
+
+  - name: payment.split_initiated
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: user_id
+    compression: lz4
+
+  - name: payment.webhook_received
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 7776000000            # 90 days — compliance
+    partition_key: payment_id
+    compression: lz4
+
+  - name: order.created
+    partitions: 128
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: store_id
+    compression: lz4
+
+  - name: order.completed
+    partitions: 128
+    replication_factor: 3
+    retention_ms: 2592000000            # 30 days — financial
+    partition_key: store_id
+    compression: lz4
+
+  - name: order.payment_requested
+    partitions: 64
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: order_id
+    compression: lz4
+
+  - name: exit.validated
+    partitions: 64
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: store_id
+    compression: lz4
+
+  - name: exit.denied
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: store_id
+    compression: lz4
+
+  - name: exit.override_used
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 2592000000            # 30 days — compliance
+    partition_key: store_id
+    compression: lz4
+
+  - name: exit.alarm_triggered
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: store_id
+    compression: lz4
+
+  # ── TIER 2: HIGH VOLUME — cart + inventory ───────────────────────────────
+  # Highest event volume in the system
+
+  - name: cart.item_scanned
+    partitions: 256                     # CRITICAL: highest volume topic
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+    config:
+      message.max.bytes: "1048576"      # 1 MB max per scan event
+
+  - name: cart.item_added
+    partitions: 128
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: cart.item_removed
+    partitions: 64
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: cart.abandoned
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: cart.checkout_initiated
+    partitions: 64
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: user_id
+    compression: lz4
+
+  - name: inventory.hold_request
+    partitions: 256
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: "store_id+sku_id hash"
+    compression: lz4
+
+  - name: inventory.low_stock
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: inventory.shrinkage_detected
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: store_id
+    compression: lz4
+
+  - name: inventory.shrinkage_alert
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: store_id
+    compression: lz4
+
+  - name: inventory.reorder_triggered
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  # ── TIER 3: AUTH + SESSION ───────────────────────────────────────────────
+
+  - name: auth.otp_sent
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: phone_prefix          # country-code prefix for flood detection
+    compression: lz4
+
+  - name: auth.login_success
+    partitions: 64
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: user_id
+    compression: lz4
+
+  - name: auth.login_failed
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: phone
+    compression: lz4
+
+  - name: auth.account_locked
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: phone
+    compression: lz4
+
+  - name: auth.session_created
+    partitions: 64
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: user_id
+    compression: lz4
+
+  - name: auth.session_ended
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: user_id
+    compression: lz4
+
+  - name: auth.staff_login
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: account.deletion_requested
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 2592000000            # 30 days — DPDPA compliance
+    partition_key: user_id
+    compression: lz4
+
+  # ── TIER 4: STORE + CATALOG ──────────────────────────────────────────────
+
+  - name: store.session_started
+    partitions: 64
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: store.queue_joined
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: store.qr_generated
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: store.capacity_alert
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: store.going_offline
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: store.server_recovered
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: catalog.product_updated
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: catalog.price_updated
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: catalog.import_job
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: catalog.bulk_import_complete
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  # ── TIER 5: LOYALTY + SUPPORT + OFFER ───────────────────────────────────
+
+  - name: loyalty.points_earned
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: user_id
+    compression: lz4
+
+  - name: loyalty.tier_changed
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: user_id
+    compression: lz4
+
+  - name: refund.requested
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: order_id
+    compression: lz4
+
+  - name: refund.completed
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: order_id
+    compression: lz4
+
+  - name: support.ticket_created
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: support.ticket_escalated
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: offer.applied
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  # ── TIER 6: USER SEGMENTS + ACCOUNT ─────────────────────────────────────
+
+  - name: user.segment_updated
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: user_id
+    compression: lz4
+
+  - name: user.account_merged
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: user_id
+    compression: lz4
+
+  # ── TIER 7: WAREHOUSE + TRANSFER + QC (Part 2) ──────────────────────────
+
+  - name: warehouse.grn_discrepancy
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: warehouse_id
+    compression: lz4
+
+  - name: warehouse.grn_confirmed
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: warehouse_id
+    compression: lz4
+
+  - name: warehouse.transfer_dispatched
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: warehouse_id
+    compression: lz4
+
+  - name: transfer.dispatched
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: from_store_id
+    compression: lz4
+
+  - name: transfer.confirmed
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: to_store_id
+    compression: lz4
+
+  - name: qc.inspection_complete
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: grn_id
+    compression: lz4
+
+  # ── TIER 8: DEVICE + ADMIN + ERP (Part 3) ───────────────────────────────
+
+  - name: device.offline
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: device.alarm
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: device.heartbeat_missed
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: admin.store_onboarded
+    partitions: 4
+    replication_factor: 3
+    retention_ms: 2592000000
+    partition_key: chain_id
+    compression: lz4
+
+  - name: admin.config_changed
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: admin.audit_event
+    partitions: 128
+    replication_factor: 3
+    retention_ms: 7776000000            # 90 days — compliance
+    partition_key: service_name
+    compression: lz4
+    config:
+      # Tiered storage: keep 30 days local, 60 days in S3
+      remote.storage.enable: "true"
+      local.retention.ms: "2592000000"
+
+  - name: erp.sync_complete
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: erp.sync_failed
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+  - name: erp.sync_jobs
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    partition_key: store_id
+    compression: lz4
+
+# =============================================================================
+# TOTAL SUMMARY
+# =============================================================================
+summary:
+  total_topics: 62
+  total_partitions: 3124              # sum of all partition counts
+  total_replicas: 9372                # partitions × replication_factor
+  brokers_required: 12
+  estimated_peak_throughput: "~14K msgs/sec sustained | ~85K msgs/sec peak"
+  estimated_storage_per_day: "~2.8 TB raw | ~900 GB compressed (lz4 ~3x)"
+  monthly_storage_s3_tiered: "~27 TB (7-day local) + S3 tiered for compliance topics"

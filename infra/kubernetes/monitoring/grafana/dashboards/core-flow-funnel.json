@@ -1,0 +1,9 @@
+{
+  "title": "Core Flow Funnel",
+  "tags": ["zippyra", "funnel"],
+  "panels": [
+    { "type": "barchart", "title": "Scan → Cart → Checkout → Payment → Exit Funnel", "targets": [{"expr": "funnel_conversion_rates"}] },
+    { "type": "timeseries", "title": "Drop-off Rate per Step", "targets": [{"expr": "funnel_dropoff_rates"}] },
+    { "type": "timeseries", "title": "P99 Latency per Step", "targets": [{"expr": "histogram_quantile(0.99, sum(rate(funnel_step_duration_seconds_bucket[5m])) by (le, step))"}] }
+  ]
+}

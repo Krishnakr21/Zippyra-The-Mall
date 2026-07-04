@@ -1,0 +1,57 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 11 — NOTIFICATION SERVICE
+// Tables: user_notification_prefs, notification_delivery_log
+// =============================================================================
+
+// [GAP-B] user_notification_prefs — Referenced in Flow B-4 (Comms Preferences)
+// Notification routing (WhatsApp vs SMS vs Push vs Email) entirely depends on this
+Table user_notification_prefs {
+  user_id             uuid          [pk, ref: > users.id]
+  whatsapp_enabled    boolean       [not null, default: true]
+  sms_enabled         boolean       [not null, default: true]
+  push_enabled        boolean       [not null, default: true]
+  email_enabled       boolean       [not null, default: false, note: 'Off by default; enabled when email is verified']
+  updated_at          timestamptz   [not null, default: `now()`]
+
+  Note: '[GAP-B FIX] Required for Flow B-4 Comms Preferences. Notification Service reads this before dispatching any notification to determine which channel(s) to use.'
+}
+
+
+// [GAP-B] notification_delivery_log — Service Registry lists delivery_log (PostgreSQL)
+// Never schema-defined in original
+Table notification_delivery_log {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  user_id           uuid          [not null, ref: > users.id]
+  channel           varchar(20)   [not null, note: 'WHATSAPP | SMS | PUSH | EMAIL']
+  status            varchar(20)   [not null, note: 'SENT | DELIVERED | FAILED | BOUNCED']
+  notification_type varchar(50)   [not null, note: 'OTP | ORDER_CONFIRMATION | REFUND | LOYALTY | PROMOTIONAL | TICKET_UPDATE']
+  reference_id      uuid          [null, note: 'ID of the entity this notification is about e.g. order_id, refund_id, ticket_id']
+  reference_type    varchar(50)   [null, note: 'Entity type e.g. ORDER | REFUND | TICKET | OTP — pairs with reference_id']
+  provider_message_id varchar(255) [null, note: 'Message ID returned by the channel provider (Twilio SID, FCM message_id, etc.) — needed to query delivery status via webhook']
+  error_details     text          [null, note: 'Error description from provider for FAILED or BOUNCED status. e.g. "Invalid phone number", "FCM token expired". Null for SENT/DELIVERED.']
+  sent_at           timestamptz   [not null, default: `now()`]
+  delivered_at      timestamptz   [null, note: 'Set via delivery webhook from channel provider']
+
+  indexes {
+    user_id          [name: 'idx_notification_delivery_log_user_id']
+    channel          [name: 'idx_notification_delivery_log_channel']
+    status           [name: 'idx_notification_delivery_log_status']
+    sent_at          [name: 'idx_notification_delivery_log_sent_at']
+    reference_id     [name: 'idx_notification_delivery_log_reference_id', note: 'Look up all notifications sent about a specific order or refund']
+    provider_message_id [name: 'idx_notification_delivery_log_provider_msg_id', note: 'Webhook delivery callback lookup by provider message ID']
+  }
+
+  Note: '[GAP-B FIX] Notification Service owner. provider_message_id enables webhook-based delivery confirmation. error_details enables intelligent retry and failure diagnosis for FAILED/BOUNCED.'
+}
+
+
+// =============================================================================

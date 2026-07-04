@@ -1,0 +1,217 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 3 — CATALOG SERVICE
+// Tables: categories, products, pricing_rules, offers, offer_rules,
+//         combo_rules, combo_items, recipes, recipe_ingredients
+// =============================================================================
+
+// [GAP-A] categories — Referenced in Flows 7.6, 7.7, D-7 but entirely absent
+Table categories {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null]
+  parent_id       uuid          [null, ref: > categories.id, note: 'Self-referencing for sub-categories; null = top-level']
+  store_id        uuid          [not null, ref: > stores.id]
+  product_count   integer       [not null, default: 0, note: 'Denormalised counter; updated on product insert/delete']
+  image_url       varchar(500)  [null, note: 'CDN URL for category tile image']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id       [name: 'idx_categories_store_id']
+    parent_id      [name: 'idx_categories_parent_id']
+    (store_id, name) [name: 'idx_categories_store_name']
+  }
+
+  Note: '[GAP-A FIX] Entirely absent from original schema. Required for Flows 7.6, 7.7 (Category Browse) and D-7. Catalog Service owner.'
+}
+
+
+Table products {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  barcode         varchar(100)  [not null, note: 'EAN-13 or internal barcode']
+  name            varchar(500)  [not null]
+  description     text          [null]
+  hsn_code        varchar(20)   [not null, note: 'HSN code for GST rate lookup via hsn_gst_rates table']
+  mrp             decimal(10,2) [not null, note: 'Maximum Retail Price — legal ceiling']
+  image_url       varchar(500)  [null, note: 'S3/CDN URL: products/{store_id}/{sku_id}/{image_id}.jpg — primary product image']
+  store_id        uuid          [not null, ref: > stores.id]
+  category_id     uuid          [null, ref: > categories.id, note: 'Product category; used in Flows 7.6, 7.7 category browse and Elasticsearch filter by category']
+  shelf_id        uuid          [null, ref: > shelf_positions.id, note: 'Physical shelf location; null if not mapped yet']
+  sold_by_weight  boolean       [not null, default: false, note: '[GAP-A FIX] Flow C-7 Weight Estimation references this; was missing in v1.0']
+  weight_unit     varchar(10)   [null, note: 'Required when sold_by_weight=true. e.g. kg | g | 100g. UI renders price-per-weight label e.g. "₹120/kg". Null for unit-priced items.']
+  is_active       boolean       [not null, default: true, note: 'Soft delist flag. FK constraints on order_items.sku_id prevent hard delete for products with order history. WatermelonDB sync filters is_active=false out of local cache.']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`, note: 'WatermelonDB differential sync uses this: /v1/catalog/sync?since=ts']
+
+  indexes {
+    (barcode, store_id) [unique, name: 'uq_products_barcode_store']
+    store_id            [name: 'idx_products_store_id']
+    category_id         [name: 'idx_products_category_id']
+    hsn_code            [name: 'idx_products_hsn_code']
+    shelf_id            [name: 'idx_products_shelf_id']
+    sold_by_weight      [name: 'idx_products_sold_by_weight']
+    is_active           [name: 'idx_products_is_active']
+    updated_at          [name: 'idx_products_updated_at', note: 'Powers WatermelonDB catalog sync query']
+  }
+
+  Note: 'Catalog Service owner. UNIQUE(barcode, store_id). is_active=false soft-delists without breaking order_items FK. updated_at drives WatermelonDB differential sync. sold_by_weight added per Gap-A fix (Flow C-7).'
+}
+
+
+Table pricing_rules {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  product_id      uuid          [not null, ref: > products.id]
+  store_id        uuid          [not null, ref: > stores.id]
+  price           decimal(10,2) [not null, note: 'Selling price for this time window; must be <= products.mrp']
+  effective_from  timestamptz   [not null]
+  effective_to    timestamptz   [null, note: 'Null = currently active with no end date']
+  created_at      timestamptz   [not null, default: `now()`, note: 'When this price record was inserted — distinct from effective_from (a future price can be pre-scheduled)']
+
+  indexes {
+    product_id     [name: 'idx_pricing_rules_product_id']
+    store_id       [name: 'idx_pricing_rules_store_id']
+    (product_id, store_id, effective_from) [name: 'idx_pricing_rules_active', note: 'Cart fetches latest active price with this index']
+  }
+
+  Note: 'Time-bounded pricing. Cart Service always fetches the latest active pricing_rule for a product. created_at ≠ effective_from: a future price can be pre-inserted days ahead.'
+}
+
+
+Table offers {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null, note: 'Display name shown on offer card e.g. "10% off on Dairy"']
+  type            varchar(50)   [not null, note: 'flash | combo | coupon | loyalty_bonus | personal']
+  discount_type   varchar(20)   [not null, note: 'PERCENT | FLAT | BOGO']
+  value           decimal(10,2) [not null, note: 'Discount value — percentage or flat amount depending on discount_type']
+  min_cart        decimal(10,2) [null, note: 'Minimum cart value for offer eligibility']
+  max_discount    decimal(10,2) [null, note: 'Cap on discount amount for PERCENT type']
+  starts_at       timestamptz   [null, note: 'Null = active immediately from creation. For scheduled flash sales, set future start time. active flag alone cannot express "not yet started".']
+  ends_at         timestamptz   [null, note: 'Null = no expiry']
+  store_id        uuid          [not null, ref: > stores.id]
+  active          boolean       [not null, default: true]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id       [name: 'idx_offers_store_id']
+    type           [name: 'idx_offers_type']
+    starts_at      [name: 'idx_offers_starts_at']
+    ends_at        [name: 'idx_offers_ends_at']
+    active         [name: 'idx_offers_active']
+    (store_id, active) [name: 'idx_offers_store_active', note: 'Active offer listing per store']
+  }
+
+  Note: 'Catalog Service owner. starts_at+ends_at define the valid window for flash sales. active=false can pre-stage offers before window opens. Detailed rule conditions in offer_rules (separate per Gap-C fix).'
+}
+
+
+// [GAP-A] + [GAP-C] offer_rules — Flow B-1 "PostgreSQL --- offers; offer_rules"
+// Semicolon = two SEPARATE tables. offer_rules holds structured conditions/actions
+// Also the source for Redis key offer_rules:{store_id}
+Table offer_rules {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  offer_id        uuid          [not null, ref: > offers.id]
+  rule_type       varchar(50)   [not null, note: 'SKU_MATCH | CATEGORY_MATCH | MIN_QTY | TIME_WINDOW | USER_SEGMENT']
+  condition_json  jsonb         [not null, note: 'e.g. {"sku_ids": ["uuid1","uuid2"]} or {"min_qty": 3}']
+  action_json     jsonb         [not null, note: 'e.g. {"discount_type":"PERCENT","value":10}']
+  store_id        uuid          [not null, ref: > stores.id]
+  active          boolean       [not null, default: true]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    offer_id       [name: 'idx_offer_rules_offer_id']
+    store_id       [name: 'idx_offer_rules_store_id']
+    active         [name: 'idx_offer_rules_active']
+    (store_id, active) [name: 'idx_offer_rules_store_active', note: 'Powers Redis offer_rules:{store_id} cache refresh']
+  }
+
+  Note: '[GAP-A FIX] [GAP-C FIX] SEPARATE table from offers. Holds structured rule conditions and actions that Cart Service evaluates. Also source for Redis cache key offer_rules:{store_id} with 5min TTL.'
+}
+
+
+// [GAP-A] combo_rules — Referenced in Flow 7.9 (Combo Builder)
+Table combo_rules {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null, note: 'e.g. "Buy 2 Get 1 Free — Dairy"']
+  discount_type   varchar(20)   [not null, default: 'FLAT', note: 'PERCENT | FLAT | FREE_ITEM — discount_value is ambiguous without this. 10 could mean 10% or ₹10.']
+  discount_value  decimal(10,2) [not null]
+  store_id        uuid          [not null, ref: > stores.id]
+  active          boolean       [not null, default: true]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id       [name: 'idx_combo_rules_store_id']
+    active         [name: 'idx_combo_rules_active']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 7.9 Combo Builder. Server-side combo calculation depends on this table.'
+}
+
+
+// [GAP-A] combo_items — Referenced in Flow 7.9 (Combo Builder)
+Table combo_items {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  combo_id        uuid          [not null, ref: > combo_rules.id]
+  sku_id          uuid          [not null, ref: > products.id]
+  required_qty    integer       [not null, default: 1, note: 'Number of units of this SKU needed to qualify for combo']
+  created_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    combo_id       [name: 'idx_combo_items_combo_id']
+    sku_id         [name: 'idx_combo_items_sku_id']
+    (combo_id, sku_id) [unique, name: 'uq_combo_items_combo_sku', note: 'A SKU can only appear once per combo rule']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 7.9. Each row = one SKU required in a combo deal. UNIQUE(combo_id, sku_id) prevents duplicate SKU entries in one combo.'
+}
+
+
+// [GAP-A] recipes — Referenced in Flow 7.12 (Recipe-to-Cart)
+Table recipes {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null, note: 'e.g. "Masala Pasta"']
+  store_id        uuid          [not null, ref: > stores.id]
+  image_url       varchar(500)  [null, note: 'CDN URL for recipe card image']
+  description     text          [null]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id       [name: 'idx_recipes_store_id']
+    updated_at     [name: 'idx_recipes_updated_at']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 7.12 Recipe-to-Cart. Service Registry lists Catalog Service responsibility includes recipes.'
+}
+
+
+// [GAP-A] recipe_ingredients — Referenced in Flow 7.12 (Recipe-to-Cart)
+Table recipe_ingredients {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  recipe_id       uuid          [not null, ref: > recipes.id]
+  sku_id          uuid          [not null, ref: > products.id]
+  quantity        decimal(8,3)  [not null, note: 'Amount needed e.g. 0.5 for 500g']
+  unit            varchar(20)   [not null, note: 'kg | g | l | ml | pcs | tbsp']
+  created_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    recipe_id      [name: 'idx_recipe_ingredients_recipe_id']
+    sku_id         [name: 'idx_recipe_ingredients_sku_id']
+    (recipe_id, sku_id) [unique, name: 'uq_recipe_ingredients_recipe_sku', note: 'A SKU can only appear once per recipe; prevents duplicate cart-add']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 7.12. Batch cart-add iterates recipe_ingredients. UNIQUE(recipe_id, sku_id) prevents duplicate items being added to cart.'
+}
+
+
+// =============================================================================

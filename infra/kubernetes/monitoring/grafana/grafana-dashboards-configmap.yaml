@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  pilot-store-health.json: |
+    {
+      "dashboard": {
+        "title": "Pilot Store Health",
+        "uid": "pilot-store-health",
+        "timezone": "Asia/Kolkata",
+        "panels": [
+          {
+            "title": "Active Customers (In-Store)",
+            "type": "stat",
+            "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+            "targets": [{ "expr": "sum(zippyra_active_sessions{store_id=~\"$store_id\"})", "legendFormat": "Active" }]
+          },
+          {
+            "title": "Store Entry Rate (per min)",
+            "type": "timeseries",
+            "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+            "targets": [{ "expr": "sum(rate(zippyra_store_entries_total{store_id=~\"$store_id\"}[5m])) * 60", "legendFormat": "Entries/min" }]
+          },
+          {
+            "title": "Exit Gate Success Rate",
+            "type": "gauge",
+            "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+            "targets": [{ "expr": "sum(rate(zippyra_exit_validations_total{result=\"success\"}[5m])) / sum(rate(zippyra_exit_validations_total[5m])) * 100", "legendFormat": "Success %" }],
+            "fieldConfig": { "defaults": { "min": 0, "max": 100, "thresholds": { "steps": [{ "value": 0, "color": "red" }, { "value": 90, "color": "yellow" }, { "value": 98, "color": "green" }] } } }
+          },
+          {
+            "title": "Scan Rate (per min)",
+            "type": "timeseries",
+            "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+            "targets": [{ "expr": "sum(rate(zippyra_barcode_scans_total{store_id=~\"$store_id\"}[5m])) * 60", "legendFormat": "Scans/min" }]
+          },
+          {
+            "title": "Device Heartbeat Status",
+            "type": "table",
+            "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
+            "targets": [{ "expr": "zippyra_device_heartbeat_age_seconds{store_id=~\"$store_id\"}", "legendFormat": "{{device_type}} - {{serial_number}}", "format": "table", "instant": true }]
+          }
+        ],
+        "templating": {
+          "list": [{ "name": "store_id", "type": "query", "query": "label_values(zippyra_store_entries_total, store_id)" }]
+        }
+      }
+    }
+  payment-gateway-health.json: |
+    {
+      "dashboard": {
+        "title": "Payment Gateway Health",
+        "uid": "payment-gateway-health",
+        "timezone": "Asia/Kolkata",
+        "panels": [
+          {
+            "title": "Payment Success Rate",
+            "type": "gauge",
+            "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+            "targets": [{ "expr": "sum(rate(zippyra_payments_total{status=\"success\"}[5m])) / sum(rate(zippyra_payments_total[5m])) * 100", "legendFormat": "Success %" }],
+            "fieldConfig": { "defaults": { "min": 0, "max": 100, "thresholds": { "steps": [{ "value": 0, "color": "red" }, { "value": 95, "color": "yellow" }, { "value": 99, "color": "green" }] } } }
+          },
+          {
+            "title": "Failure Rate by Gateway",
+            "type": "timeseries",
+            "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+            "targets": [{ "expr": "sum(rate(zippyra_payments_total{status=\"failed\"}[5m])) by (gateway)", "legendFormat": "{{gateway}}" }]
+          },
+          {
+            "title": "Webhook Latency (P99)",
+            "type": "timeseries",
+            "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+            "targets": [{ "expr": "histogram_quantile(0.99, sum(rate(zippyra_webhook_duration_seconds_bucket[5m])) by (le, gateway))", "legendFormat": "{{gateway}} P99" }]
+          },
+          {
+            "title": "DLQ Depth",
+            "type": "stat",
+            "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+            "targets": [{ "expr": "sum(kafka_consumer_group_lag{topic=~\".*\\\\.dlq\"})", "legendFormat": "DLQ Messages" }],
+            "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "value": 0, "color": "green" }, { "value": 1, "color": "red" }] } } }
+          },
+          {
+            "title": "Circuit Breaker State",
+            "type": "table",
+            "gridPos": { "h": 6, "w": 12, "x": 12, "y": 0 },
+            "targets": [{ "expr": "zippyra_circuit_breaker_state", "legendFormat": "{{gateway}} - {{state}}", "format": "table", "instant": true }]
+          }
+        ]
+      }
+    }
+  core-flow-funnel.json: |
+    {
+      "dashboard": {
+        "title": "Core Flow Funnel",
+        "uid": "core-flow-funnel",
+        "timezone": "Asia/Kolkata",
+        "panels": [
+          {
+            "title": "Scan → Cart → Checkout → Payment → Exit Funnel",
+            "type": "barchart",
+            "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+            "targets": [
+              { "expr": "sum(increase(zippyra_barcode_scans_total[1h]))", "legendFormat": "Scan" },
+              { "expr": "sum(increase(zippyra_cart_additions_total[1h]))", "legendFormat": "Cart" },
+              { "expr": "sum(increase(zippyra_checkouts_total[1h]))", "legendFormat": "Checkout" },
+              { "expr": "sum(increase(zippyra_payments_total{status=\"success\"}[1h]))", "legendFormat": "Payment" },
+              { "expr": "sum(increase(zippyra_exit_validations_total{result=\"success\"}[1h]))", "legendFormat": "Exit" }
+            ]
+          },
+          {
+            "title": "Drop-off Rate Per Step (%)",
+            "type": "timeseries",
+            "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+            "targets": [
+              { "expr": "(1 - sum(rate(zippyra_cart_additions_total[5m])) / sum(rate(zippyra_barcode_scans_total[5m]))) * 100", "legendFormat": "Scan→Cart Drop" },
+              { "expr": "(1 - sum(rate(zippyra_checkouts_total[5m])) / sum(rate(zippyra_cart_additions_total[5m]))) * 100", "legendFormat": "Cart→Checkout Drop" },
+              { "expr": "(1 - sum(rate(zippyra_payments_total{status=\"success\"}[5m])) / sum(rate(zippyra_checkouts_total[5m]))) * 100", "legendFormat": "Checkout→Payment Drop" },
+              { "expr": "(1 - sum(rate(zippyra_exit_validations_total{result=\"success\"}[5m])) / sum(rate(zippyra_payments_total{status=\"success\"}[5m]))) * 100", "legendFormat": "Payment→Exit Drop" }
+            ]
+          },
+          {
+            "title": "P99 Latency Per Step",
+            "type": "timeseries",
+            "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+            "targets": [
+              { "expr": "histogram_quantile(0.99, sum(rate(zippyra_scan_duration_seconds_bucket[5m])) by (le))", "legendFormat": "Scan P99" },
+              { "expr": "histogram_quantile(0.99, sum(rate(zippyra_cart_duration_seconds_bucket[5m])) by (le))", "legendFormat": "Cart P99" },
+              { "expr": "histogram_quantile(0.99, sum(rate(zippyra_checkout_duration_seconds_bucket[5m])) by (le))", "legendFormat": "Checkout P99" },
+              { "expr": "histogram_quantile(0.99, sum(rate(zippyra_payment_duration_seconds_bucket[5m])) by (le))", "legendFormat": "Payment P99" },
+              { "expr": "histogram_quantile(0.99, sum(rate(zippyra_exit_duration_seconds_bucket[5m])) by (le))", "legendFormat": "Exit P99" }
+            ]
+          }
+        ]
+      }
+    }

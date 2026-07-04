@@ -1,0 +1,50 @@
+// Owner: Inventory Service
+// Retention: 2yr hot → S3 Glacier archive
+// Chunk interval: 1 WEEK  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table inventory_movements {
+  event_time         timestamptz   [not null, note: 'Hypertable time dimension (PK component). TimescaleDB auto-indexes.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity — UNIQUE(id, event_time)']
+  store_id           uuid          [not null, note: 'Space partition key — parallel chunk writes per store']
+  sku_id             uuid          [not null, note: 'FK → products.id']
+  delta_qty          integer       [not null, note: 'Signed: +ve = stock in, -ve = stock out/hold']
+  qty_after          integer       [not null, note: 'Snapshot of qty_available after this event — avoids cumulative SUM']
+  movement_type      varchar(30)   [not null, note: 'HOLD | RELEASE | SALE | GRN | RETURN | SHRINKAGE | TRANSFER | ADJUSTMENT']
+  reference_id       uuid          [null, note: 'order_id for SALE/HOLD | transfer_id for TRANSFER | refund_id for RETURN']
+  warehouse_id       uuid          [null, note: 'Source warehouse for GRN or TRANSFER events']
+  triggered_by       varchar(30)   [not null, note: 'CART_SCAN | CART_REMOVE | PAYMENT_CONFIRM | PAYMENT_CANCEL | GRN | RFID_RECON | MANUAL']
+  rfid_tag_id        text          [null, note: 'RFID tag scanned — populated for RFID_RECON events only']
+  user_id            uuid          [null, note: 'Customer user_id for SALE/HOLD events — NULL for system events']
+  staff_id           uuid          [null, note: 'Staff performing MANUAL adjustments — FK → users.id']
+  batch_no           text          [null, note: 'GRN batch number from warehouse — populated for GRN and TRANSFER events']
+  expiry_date        date          [null, note: 'Product expiry date for perishables — populated on GRN inwards']
+  metadata           jsonb         [null, note: 'Freeform: reason codes, PO numbers, session_id, etc.']
+  created_at         timestamptz   [not null, default: `now()`, note: 'Insert timestamp — same as event_time for real-time; may differ for replays']
+
+  indexes {
+    (event_time, id)              [pk, name: 'inventory_movements_pkey']
+    (store_id, event_time)        [name: 'idx_inv_store_time']
+    (sku_id, event_time)          [name: 'idx_inv_sku_time']
+    (movement_type, event_time)   [name: 'idx_inv_type_time']
+    (triggered_by, event_time)    [name: 'idx_inv_trigger_time']
+    reference_id                  [name: 'idx_inv_ref']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 WEEK
+  Space partition: store_id (4 partitions)
+  Compression    : after 6 months (segmentby: store_id,movement_type | orderby: event_time DESC)
+  Retention      : 24 months hot → S3 Glacier
+  Writer         : Inventory Service (direct write, synchronous)
+  Consumers      : Analytics Service, ClickHouse (via cagg inv_hourly_stock, inv_daily_shrinkage, inv_weekly_movement)
+
+  Continuous Aggregates:
+    inv_hourly_stock    — 1hr bucket — store_id,sku_id — SUM(delta_qty), MIN/MAX(qty_after)
+    inv_daily_shrinkage — 1day bucket — store_id,sku_id — SUM WHERE movement_type=SHRINKAGE
+    inv_weekly_movement — 1wk bucket — store_id — COUNT(*), SUM(ABS(delta_qty)) by type
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 1 — rfid_scan_events

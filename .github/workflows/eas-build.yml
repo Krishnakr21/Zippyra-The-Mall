@@ -1,0 +1,180 @@
+name: eas-build
+
+on:
+  push:
+    tags:
+      - "v*"  # triggers on v1.0.0, v1.2.3 etc
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  check-version:
+    name: Validate Version Tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate semver tag
+        run: |
+          TAG=${{ github.ref_name }}
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Tag $TAG is not valid semver (expected vX.Y.Z)"
+            exit 1
+          fi
+          echo "Valid version tag: $TAG"
+
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    needs: check-version
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: zippyra-customer-app/package-lock.json
+
+      - name: Set up Expo + EAS
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Install dependencies
+        working-directory: zippyra-customer-app
+        run: npm ci
+
+      - name: TypeScript check
+        working-directory: zippyra-customer-app
+        run: npx tsc --noEmit
+
+      - name: Set version from tag
+        working-directory: zippyra-customer-app
+        run: |
+          VERSION=${{ github.ref_name }}
+          VERSION=${VERSION#v}  # strip the v prefix
+          echo "Building version: $VERSION"
+          # Update app.json version
+          jq --arg v "$VERSION" '.expo.version = $v' app.json > tmp.json && mv tmp.json app.json
+
+      - name: Build Android (.apk for internal testing)
+        working-directory: zippyra-customer-app
+        run: |
+          eas build \
+            --platform android \
+            --profile preview \
+            --non-interactive \
+            --no-wait
+
+      - name: Build Android (.aab for Play Store)
+        working-directory: zippyra-customer-app
+        run: |
+          eas build \
+            --platform android \
+            --profile production \
+            --non-interactive \
+            --no-wait
+
+  build-ios:
+    name: Build iOS IPA
+    runs-on: ubuntu-latest
+    needs: check-version
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: zippyra-customer-app/package-lock.json
+
+      - name: Set up Expo + EAS
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Install dependencies
+        working-directory: zippyra-customer-app
+        run: npm ci
+
+      - name: Set version from tag
+        working-directory: zippyra-customer-app
+        run: |
+          VERSION=${{ github.ref_name }}
+          VERSION=${VERSION#v}
+          jq --arg v "$VERSION" '.expo.version = $v' app.json > tmp.json && mv tmp.json app.json
+
+      - name: Build iOS (.ipa)
+        working-directory: zippyra-customer-app
+        run: |
+          eas build \
+            --platform ios \
+            --profile production \
+            --non-interactive \
+            --no-wait
+
+  submit-stores:
+    name: Submit to App Stores
+    runs-on: ubuntu-latest
+    needs: [build-android, build-ios]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Expo + EAS
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Submit Android to Play Store
+        working-directory: zippyra-customer-app
+        run: |
+          eas submit \
+            --platform android \
+            --latest \
+            --non-interactive
+        env:
+          EXPO_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+
+      - name: Submit iOS to App Store
+        working-directory: zippyra-customer-app
+        run: |
+          eas submit \
+            --platform ios \
+            --latest \
+            --non-interactive
+        env:
+          EXPO_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+
+  notify:
+    name: Notify Release
+    runs-on: ubuntu-latest
+    needs: submit-stores
+    if: always()
+
+    steps:
+      - name: Release summary
+        run: |
+          echo "==============================="
+          echo "Release: ${{ github.ref_name }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Status: ${{ needs.submit-stores.result }}"
+          echo "==============================="

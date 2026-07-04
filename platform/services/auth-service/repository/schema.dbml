@@ -1,0 +1,132 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 1 — AUTH SERVICE
+// Tables: users, auth_events, admin_actions, login_attempts,
+//         email_verifications, app_versions
+// =============================================================================
+
+Table users {
+  id            uuid          [pk, default: `gen_random_uuid()`, note: 'Primary key']
+  phone         varchar(15)   [unique, not null, note: 'E.164 format, e.g. +919876543210']
+  email         varchar(255)  [unique, null, note: 'Optional; linked via email_verifications flow']
+  created_at    timestamptz   [not null, default: `now()`]
+  updated_at    timestamptz   [not null, default: `now()`, note: 'Updated on email link, soft-delete, profile edits']
+  last_login    timestamptz   [null]
+  is_deleted    boolean       [not null, default: false, note: 'Soft delete; DPDP PII purge triggers hard delete']
+
+  indexes {
+    phone        [unique, name: 'uq_users_phone']
+    email        [unique, name: 'uq_users_email']
+    is_deleted   [name: 'idx_users_is_deleted']
+    created_at   [name: 'idx_users_created_at']
+  }
+
+  Note: 'Core user identity table. Auth Service owner. Soft delete only — hard delete triggered by DPDP PII purge on account.deletion_requested Kafka event.'
+}
+
+
+Table auth_events {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  user_id       uuid          [not null, ref: > users.id]
+  event_type    varchar(50)   [not null, note: 'e.g. OTP_SENT, LOGIN_SUCCESS, LOGOUT, SESSION_EXPIRED']
+  device_id     varchar(255)  [null]
+  ip            inet          [null]
+  timestamp     timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id      [name: 'idx_auth_events_user_id']
+    event_type   [name: 'idx_auth_events_event_type']
+    timestamp    [name: 'idx_auth_events_timestamp']
+  }
+
+  Note: 'Append-only. Never updated. Compliance audit trail. Forever retention. One of the 4 immutable audit tables listed in Security section.'
+}
+
+
+// [GAP-B] admin_actions — Security section lists this as append-only audit table
+// but it was never schema-defined in original document. Added per Gap Analysis.
+Table admin_actions {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  admin_id      uuid          [not null, ref: > users.id, note: 'The admin user performing the action']
+  action_type   varchar(100)  [not null, note: 'e.g. PRODUCT_EDIT, USER_BAN, REFUND_APPROVE, PRICE_CHANGE']
+  target_type   varchar(50)   [null, note: 'Entity type of target_id. e.g. USER | PRODUCT | ORDER | REFUND | OFFER | STORE. Without this, target_id uuid cannot be joined to any table.']
+  target_id     uuid          [null, note: 'ID of the entity being acted upon (user, product, order, etc.)']
+  metadata      jsonb         [null, note: 'Flexible payload: old_value, new_value, reason, etc.']
+  performed_at  timestamptz   [not null, default: `now()`]
+
+  indexes {
+    admin_id     [name: 'idx_admin_actions_admin_id']
+    action_type  [name: 'idx_admin_actions_action_type']
+    performed_at [name: 'idx_admin_actions_performed_at']
+    target_type  [name: 'idx_admin_actions_target_type']
+    target_id    [name: 'idx_admin_actions_target_id']
+    (target_type, target_id) [name: 'idx_admin_actions_target', note: 'Look up all admin actions on a specific entity e.g. all actions on product X']
+  }
+
+  Note: '[GAP-B FIX] Append-only immutable audit log for all admin actions. target_type required to make target_id meaningful — without it a bare uuid has no JOIN target. Never updated.'
+}
+
+
+// [GAP-A] login_attempts — Referenced in Flow 3.10 (Account Locked)
+// "PostgreSQL: login_attempts log" — absent from original schema
+Table login_attempts {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  user_id       uuid          [null, ref: > users.id, note: 'Null if user not found by phone lookup']
+  phone         varchar(15)   [not null, note: 'Always logged, even if user_id is null']
+  ip            inet          [null]
+  attempt_at    timestamptz   [not null, default: `now()`]
+  success       boolean       [not null, default: false]
+
+  indexes {
+    phone        [name: 'idx_login_attempts_phone']
+    user_id      [name: 'idx_login_attempts_user_id']
+    attempt_at   [name: 'idx_login_attempts_attempt_at']
+    (phone, attempt_at) [name: 'idx_login_attempts_phone_time', note: 'Used for rate limiting / lockout detection']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 3.10 Account Locked flow. Tracks all OTP/login attempts per phone for lockout logic. account_locked:{phone} Redis key is set after threshold hit.'
+}
+
+
+// [GAP-A] email_verifications — Referenced in Flow 3.11 (Email Linkage)
+// No table defined in original schema
+Table email_verifications {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  user_id       uuid          [not null, ref: > users.id]
+  email         varchar(255)  [not null]
+  token_hash    varchar(255)  [not null, note: 'Hashed verification token; never store raw token']
+  verified_at   timestamptz   [null, note: 'Null until user clicks email link']
+  expires_at    timestamptz   [not null, note: 'Typically now() + 24 hours']
+
+  indexes {
+    user_id      [name: 'idx_email_verifications_user_id']
+    token_hash   [unique, name: 'uq_email_verifications_token_hash']
+    expires_at   [name: 'idx_email_verifications_expires_at']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 3.11 Email Linkage. Token is emailed to user; on click, token_hash verified and users.email updated.'
+}
+
+
+// [GAP-A] app_versions — Referenced in Flows 1.2 & 1.3 (Version Check / Force Update)
+// Must be added before Phase 1 MVP
+Table app_versions {
+  platform      varchar(10)   [pk, note: 'ios or android']
+  min_version   varchar(20)   [not null, note: 'Minimum supported version — below this, force update shown']
+  latest_version varchar(20)  [not null, note: 'Current latest released version']
+  force_update  boolean       [not null, default: false, note: 'If true, block app usage until user updates']
+  updated_at    timestamptz   [not null, default: `now()`]
+
+  Note: '[GAP-A FIX] Required for Flows 1.2 and 1.3. App checks this on launch. If current_version < min_version and force_update = true, user is blocked with upgrade screen.'
+}
+
+
+// =============================================================================

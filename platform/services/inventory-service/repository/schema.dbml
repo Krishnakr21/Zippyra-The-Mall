@@ -1,0 +1,38 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 5 — INVENTORY SERVICE
+// Table: stock
+// =============================================================================
+
+// [GAP-A] CRITICAL — stock table — Service Registry explicitly names PostgreSQL (stock)
+// as Inventory Service primary DB — table was COMPLETELY absent from original schema
+Table stock {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  sku_id          uuid          [not null, ref: > products.id]
+  store_id        uuid          [not null, ref: > stores.id]
+  qty_available   integer       [not null, default: 0, note: 'Units available for purchase (not reserved)']
+  qty_reserved    integer       [not null, default: 0, note: 'Units held by active carts (cart.item_scanned Kafka event)']
+  qty_on_hand     integer       [not null, default: 0, note: 'Physical count = qty_available + qty_reserved']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (sku_id, store_id) [unique, name: 'uq_stock_sku_store']
+    store_id           [name: 'idx_stock_store_id']
+    qty_available      [name: 'idx_stock_qty_available', note: 'Powers low_stock detection queries']
+    updated_at         [name: 'idx_stock_updated_at']
+  }
+
+  Note: '[GAP-A CRITICAL FIX] Most critical missing table. Cart hold, shrinkage detection, and all stock checks depend on this. qty_reserved incremented on cart.item_scanned, decremented on cart.item_removed or order.completed.'
+}
+
+
+// =============================================================================

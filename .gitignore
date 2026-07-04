@@ -1,0 +1,60 @@
+# ─── Go ──────────────────────────────────────────
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# ─── Node.js ─────────────────────────────────────
+node_modules/
+.next/
+dist/
+build/
+
+# ─── React Native ────────────────────────────────
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/ios/Pods/
+mobile/ios/build/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+
+# ─── Environment ─────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.env
+
+# ─── IDE ─────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ─── Terraform ───────────────────────────────────
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+
+# ─── Docker ──────────────────────────────────────
+docker-compose.override.yaml
+
+# ─── Logs ────────────────────────────────────────
+*.log
+logs/
+
+# ─── Coverage ────────────────────────────────────
+coverage/
+*.cover
+*.prof

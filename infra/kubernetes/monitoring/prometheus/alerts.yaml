@@ -1,0 +1,64 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: zippyra-core-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: zippyra-alerts
+      rules:
+        - alert: ZippyraHighErrorRate
+          expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.01
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "High Server Error Rate"
+            description: "Global 5xx error rate has exceeded 1% for the last 5 minutes."
+
+        - alert: ZippyraHighLatency
+          expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High P99 Latency Detected"
+            description: "P99 latency is exceeding 500ms for the last 5 minutes."
+
+        - alert: ZippyraDLQDepth
+          expr: kafka_consumer_group_lag{topic=~".*\\.dlq"} > 0
+          for: 30s
+          labels:
+            severity: critical
+          annotations:
+            summary: "Kafka Dead Letter Queue Has Messages"
+            description: "A dead letter queue has depth > 0, indicating processing failures."
+
+        - alert: ZippyraPaymentServiceDown
+          expr: up{job="payment-service"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Payment Service Down"
+            description: "Payment service has been unreachable for over 1 minute."
+
+        - alert: ZippyraAuthServiceDown
+          expr: up{job="auth-service"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Auth Service Down"
+            description: "Auth service has been unreachable for over 1 minute."
+
+        - alert: ZippyraHighMemory
+          expr: container_memory_usage_bytes / container_spec_memory_limit_bytes > 0.80
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod Memory Usage High"
+            description: "Container memory usage has exceeded 80% of limit for 10 minutes."

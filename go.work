@@ -1,0 +1,25 @@
+go 1.24.1
+
+use (
+	./platform
+	./platform/cmd/admin-cli
+	./platform/services/admin-auth-service
+	./platform/services/admin-store-service
+	./platform/services/analytics-service
+	./platform/services/auth-service
+	./platform/services/cart-service
+	./platform/services/catalog-service
+	./platform/services/chain-hq-service
+	./platform/services/compliance-service
+	./platform/services/exit-validation-service
+	./platform/services/inventory-service
+	./platform/services/loyalty-service
+	./platform/services/notification-service
+	./platform/services/order-service
+	./platform/services/payment-service
+	./platform/services/retailer-auth-service
+	./platform/services/store-service
+	./platform/services/support-service
+	./platform/services/warehouse-service
+	./platform/shared
+)

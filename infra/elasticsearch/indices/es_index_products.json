@@ -1,0 +1,348 @@
+{
+  "_meta": {
+    "index": "products",
+    "description": "Unified product catalog index. Replaces 15,000+ per-store products_{store_id} indices. Uses store_id routing for physical data isolation.",
+    "owner": "Catalog Service",
+    "version": "1.0",
+    "date": "March 2026",
+    "shards": 64,
+    "replicas": 1,
+    "routing_field": "store_id",
+    "routing_required": true
+  },
+  "settings": {
+    "number_of_shards": 64,
+    "number_of_replicas": 1,
+    "routing.allocation.require.data": "hot",
+    "index.routing_partition_size": 4,
+    "refresh_interval": "5s",
+    "analysis": {
+      "tokenizer": {
+        "edge_ngram_tokenizer": {
+          "type": "edge_ngram",
+          "min_gram": 2,
+          "max_gram": 10,
+          "token_chars": ["letter", "digit"]
+        },
+        "hindi_transliteration_tokenizer": {
+          "type": "edge_ngram",
+          "min_gram": 2,
+          "max_gram": 15,
+          "token_chars": ["letter"]
+        }
+      },
+      "filter": {
+        "autocomplete_filter": {
+          "type": "edge_ngram",
+          "min_gram": 2,
+          "max_gram": 10
+        },
+        "hindi_stop": {
+          "type": "stop",
+          "stopwords": ["का", "की", "के", "है", "हैं", "में", "से", "और", "पर", "को"]
+        },
+        "synonym_filter": {
+          "type": "synonym",
+          "synonyms": [
+            "maggi, noodles, instant noodles",
+            "amul, amul dairy, amul butter",
+            "biscuit, cookie, biskut",
+            "dahi, curd, yogurt",
+            "atta, wheat flour, aata",
+            "dal, lentils, daal",
+            "toor, arhar, tuvar",
+            "chips, wafers, crisps",
+            "namkeen, snack, farsan",
+            "shampoo, hair wash, hair cleaner"
+          ]
+        }
+      },
+      "analyzer": {
+        "autocomplete_analyzer": {
+          "type": "custom",
+          "tokenizer": "edge_ngram_tokenizer",
+          "filter": ["lowercase", "asciifolding", "synonym_filter"]
+        },
+        "search_analyzer": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding", "synonym_filter"]
+        },
+        "hindi_analyzer": {
+          "type": "custom",
+          "tokenizer": "hindi_transliteration_tokenizer",
+          "filter": ["lowercase", "hindi_stop"]
+        },
+        "keyword_lowercase": {
+          "type": "custom",
+          "tokenizer": "keyword",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "_routing": {
+      "required": true
+    },
+    "dynamic": "strict",
+    "properties": {
+      "store_id": {
+        "type": "keyword",
+        "_comment": "ALWAYS set as routing key. Every query must include store_id filter."
+      },
+      "sku_id": {
+        "type": "keyword"
+      },
+      "barcode": {
+        "type": "keyword",
+        "_comment": "Exact match for barcode scan fallback when Redis misses"
+      },
+      "name": {
+        "type": "text",
+        "analyzer": "autocomplete_analyzer",
+        "search_analyzer": "search_analyzer",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "ignore_above": 256
+          },
+          "hindi": {
+            "type": "text",
+            "analyzer": "hindi_analyzer",
+            "_comment": "Enables Hindi script + Hinglish transliteration queries"
+          }
+        }
+      },
+      "brand": {
+        "type": "text",
+        "analyzer": "autocomplete_analyzer",
+        "search_analyzer": "search_analyzer",
+        "fields": {
+          "keyword": { "type": "keyword", "ignore_above": 128 }
+        }
+      },
+      "description": {
+        "type": "text",
+        "analyzer": "search_analyzer",
+        "_comment": "Full-text only — not indexed for autocomplete to keep index lean"
+      },
+      "category_id": {
+        "type": "keyword"
+      },
+      "category_name": {
+        "type": "keyword",
+        "_comment": "Denormalized for facet filtering — no join needed"
+      },
+      "subcategory_id": {
+        "type": "keyword"
+      },
+      "subcategory_name": {
+        "type": "keyword"
+      },
+      "hsn_code": {
+        "type": "keyword"
+      },
+      "mrp": {
+        "type": "scaled_float",
+        "scaling_factor": 100,
+        "_comment": "Store MRP in paise (x100) for exact arithmetic — never float for prices"
+      },
+      "effective_price": {
+        "type": "scaled_float",
+        "scaling_factor": 100,
+        "_comment": "Current selling price after pricing_rules applied. Updated on Kafka catalog.price_updated event."
+      },
+      "discount_pct": {
+        "type": "short",
+        "_comment": "Pre-computed: ((mrp - effective_price) / mrp) * 100. Used for sort-by-discount."
+      },
+      "in_stock": {
+        "type": "boolean",
+        "_comment": "Updated from Inventory Service via catalog.product_updated Kafka event. Drives OOS items to bottom of results."
+      },
+      "stock_qty": {
+        "type": "integer",
+        "_comment": "Approximate — updated from Redis product_availability:{store_id}:{sku_id} every 30s via sync job"
+      },
+      "shelf_location": {
+        "type": "keyword",
+        "_comment": "Aisle + shelf code e.g. 'A3-S2'. Shown in 7.4 results and D-6 AR Item Found."
+      },
+      "is_rfid_tagged": {
+        "type": "boolean"
+      },
+      "sold_by_weight": {
+        "type": "boolean",
+        "_comment": "If true: barcode scan → prompt for weight entry at scan screen"
+      },
+      "cold_storage_required": {
+        "type": "boolean"
+      },
+      "is_active": {
+        "type": "boolean",
+        "_comment": "Soft delete. Set to false instead of deleting document."
+      },
+      "has_offer": {
+        "type": "boolean",
+        "_comment": "True if any active offer covers this SKU. Pre-computed on offer activation/expiry."
+      },
+      "offer_type": {
+        "type": "keyword",
+        "_comment": "FLASH | COMBO | PERSONAL | LOYALTY_BONUS | null"
+      },
+      "offer_badge_text": {
+        "type": "keyword",
+        "_comment": "Short badge string e.g. '20% off' or 'Buy 2 Get 1'. Rendered directly in search results card."
+      },
+      "tags": {
+        "type": "keyword",
+        "_comment": "Free-form tags: ['organic', 'gluten_free', 'vegan', 'diabetic_friendly', 'low_sugar']"
+      },
+      "image_url": {
+        "type": "keyword",
+        "index": false,
+        "_comment": "CDN URL — not indexed, just stored for display in search results"
+      },
+      "weight_grams": {
+        "type": "integer",
+        "_comment": "Package weight in grams. Used for weight-based sort and filter."
+      },
+      "unit_of_measure": {
+        "type": "keyword",
+        "_comment": "kg | g | ml | l | pcs | pack"
+      },
+      "pack_size": {
+        "type": "keyword",
+        "_comment": "Pack description e.g. '500g', '6 pack', '1L'. Shown in search results."
+      },
+      "popularity_score": {
+        "type": "float",
+        "_comment": "Pre-computed from ClickHouse: weighted scan count + purchase rate. Updated hourly by Analytics Service. Used for relevance boosting."
+      },
+      "updated_at": {
+        "type": "date",
+        "format": "strict_date_time"
+      },
+      "indexed_at": {
+        "type": "date",
+        "format": "strict_date_time"
+      }
+    }
+  },
+  "aliases": {
+    "products_read": {
+      "_comment": "Read alias — always query via this alias, never the index name directly. Allows zero-downtime reindexing."
+    },
+    "products_write": {
+      "_comment": "Write alias — Catalog Service indexes via this alias."
+    }
+  },
+  "_query_examples": {
+    "autocomplete": {
+      "_comment": "Screen 7.3 — debounced at 300ms in React Native",
+      "query": {
+        "bool": {
+          "must": [
+            {
+              "multi_match": {
+                "query": "<user_input>",
+                "fields": ["name^3", "brand^2", "name.hindi^2"],
+                "type": "bool_prefix",
+                "analyzer": "search_analyzer"
+              }
+            }
+          ],
+          "filter": [
+            { "term": { "store_id": "<store_id_from_session>" } },
+            { "term": { "is_active": true } }
+          ]
+        }
+      },
+      "sort": [
+        { "popularity_score": { "order": "desc" } },
+        "_score"
+      ],
+      "size": 6,
+      "_source": ["sku_id", "name", "brand", "category_name", "image_url", "effective_price", "in_stock"],
+      "routing": "<store_id>"
+    },
+    "full_text_search": {
+      "_comment": "Screen 7.4 — full search results with filters",
+      "query": {
+        "bool": {
+          "must": [
+            {
+              "multi_match": {
+                "query": "<user_query>",
+                "fields": ["name^4", "brand^3", "description^1", "name.hindi^2", "tags^1"],
+                "type": "best_fields",
+                "fuzziness": "AUTO",
+                "prefix_length": 2,
+                "analyzer": "search_analyzer"
+              }
+            }
+          ],
+          "filter": [
+            { "term": { "store_id": "<store_id>" } },
+            { "term": { "is_active": true } }
+          ],
+          "should": [
+            { "term": { "has_offer": true } },
+            { "term": { "in_stock": true } },
+            { "range": { "popularity_score": { "gt": 50 } } }
+          ],
+          "boost_mode": "multiply"
+        }
+      },
+      "sort": [
+        { "_score": { "order": "desc" } },
+        { "in_stock": { "order": "desc" } },
+        { "popularity_score": { "order": "desc" } }
+      ],
+      "aggs": {
+        "categories": { "terms": { "field": "category_name", "size": 10 } },
+        "price_range": { "stats": { "field": "effective_price" } },
+        "brands": { "terms": { "field": "brand.keyword", "size": 20 } },
+        "has_offer": { "filter": { "term": { "has_offer": true } } }
+      },
+      "routing": "<store_id>"
+    },
+    "oos_alternatives": {
+      "_comment": "Screen D-4 — similar products when item is out of stock",
+      "query": {
+        "bool": {
+          "must": [
+            { "term": { "category_id": "<category_id_of_oos_sku>" } },
+            { "term": { "in_stock": true } }
+          ],
+          "filter": [
+            { "term": { "store_id": "<store_id>" } },
+            { "term": { "is_active": true } },
+            { "range": { "effective_price": { "gte": "<price*0.7>", "lte": "<price*1.3>" } } }
+          ],
+          "must_not": [
+            { "term": { "sku_id": "<oos_sku_id>" } }
+          ]
+        }
+      },
+      "sort": [
+        { "popularity_score": { "order": "desc" } }
+      ],
+      "size": 6,
+      "routing": "<store_id>"
+    },
+    "voice_search": {
+      "_comment": "Screen 7.11 — after Google STT transcription, same as full_text_search but fuzziness increased",
+      "query": {
+        "multi_match": {
+          "query": "<stt_transcript>",
+          "fields": ["name^4", "brand^3", "name.hindi^3", "tags^1"],
+          "type": "best_fields",
+          "fuzziness": "2",
+          "prefix_length": 1
+        }
+      }
+    }
+  }
+}

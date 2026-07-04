@@ -1,0 +1,369 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>repository: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/zippyra/platform/services/cart-service/internal/repository/cart_repo.go (98.4%)</option>
+				
+				<option value="file1">github.com/zippyra/platform/services/cart-service/internal/repository/product_repo.go (97.5%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package repository
+
+import (
+        "context"
+        "encoding/json"
+        "fmt"
+        "time"
+
+        "github.com/google/uuid"
+        "github.com/jackc/pgx/v5"
+        "github.com/jackc/pgx/v5/pgxpool"
+        "github.com/redis/go-redis/v9"
+        "github.com/zippyra/platform/services/cart-service/internal/model"
+)
+
+type pgxDB interface {
+        Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+type CartRepository interface {
+        AddToCart(ctx context.Context, userID, storeID string, item model.CartItem) error
+        GetCartItems(ctx context.Context, userID, storeID string) ([]model.CartItem, error)
+        RemoveItem(ctx context.Context, userID, storeID, barcode string) (*model.CartItem, error)
+        ClearCart(ctx context.Context, userID, storeID string) ([]model.CartItem, error)
+        AcquireCheckoutLock(ctx context.Context, userID string, ttl time.Duration) (bool, error)
+        ReleaseCheckoutLock(ctx context.Context, userID string) error
+        DecrementStock(ctx context.Context, storeID, productID string, quantity int) (int64, error)
+        IncrementStock(ctx context.Context, storeID, productID string, quantity int) (int64, error)
+        GetStock(ctx context.Context, storeID, productID string) (int64, error)
+        SnapshotCart(ctx context.Context, cart *model.Cart) (string, error)
+}
+
+type redisCartRepo struct {
+        rdb *redis.Client
+        db  pgxDB
+}
+
+func NewCartRepository(rdb *redis.Client, db *pgxpool.Pool) CartRepository <span class="cov8" title="1">{
+        return &amp;redisCartRepo{rdb: rdb, db: db}
+}</span>
+
+func (r *redisCartRepo) AddToCart(ctx context.Context, userID, storeID string, item model.CartItem) error <span class="cov8" title="1">{
+        key := fmt.Sprintf("cart:%s:%s", userID, storeID)
+        data, err := json.Marshal(item)
+        if err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+        <span class="cov8" title="1">return r.rdb.HSet(ctx, key, item.Barcode, data).Err()</span>
+}
+
+func (r *redisCartRepo) GetCartItems(ctx context.Context, userID, storeID string) ([]model.CartItem, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("cart:%s:%s", userID, storeID)
+        res, err := r.rdb.HGetAll(ctx, key).Result()
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">items := make([]model.CartItem, 0, len(res))
+        for _, val := range res </span><span class="cov8" title="1">{
+                var item model.CartItem
+                if err := json.Unmarshal([]byte(val), &amp;item); err != nil </span><span class="cov8" title="1">{
+                        continue</span>
+                }
+                <span class="cov8" title="1">items = append(items, item)</span>
+        }
+        <span class="cov8" title="1">return items, nil</span>
+}
+
+func (r *redisCartRepo) RemoveItem(ctx context.Context, userID, storeID, barcode string) (*model.CartItem, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("cart:%s:%s", userID, storeID)
+        
+        val, err := r.rdb.HGet(ctx, key, barcode).Result()
+        if err == redis.Nil </span><span class="cov8" title="1">{
+                return nil, nil
+        }</span> else<span class="cov8" title="1"> if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">var item model.CartItem
+        if err := json.Unmarshal([]byte(val), &amp;item); err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">if err := r.rdb.HDel(ctx, key, barcode).Err(); err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">return &amp;item, nil</span>
+}
+
+func (r *redisCartRepo) ClearCart(ctx context.Context, userID, storeID string) ([]model.CartItem, error) <span class="cov8" title="1">{
+        items, err := r.rdb.HGetAll(ctx, fmt.Sprintf("cart:%s:%s", userID, storeID)).Result()
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">cartItems := make([]model.CartItem, 0, len(items))
+        for _, val := range items </span><span class="cov8" title="1">{
+                var item model.CartItem
+                if err := json.Unmarshal([]byte(val), &amp;item); err == nil </span><span class="cov8" title="1">{
+                        cartItems = append(cartItems, item)
+                }</span>
+        }
+
+        <span class="cov8" title="1">err = r.rdb.Del(ctx, fmt.Sprintf("cart:%s:%s", userID, storeID)).Err()
+        return cartItems, err</span>
+}
+
+func (r *redisCartRepo) AcquireCheckoutLock(ctx context.Context, userID string, ttl time.Duration) (bool, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("checkout:%s", userID)
+        return r.rdb.SetNX(ctx, key, "1", ttl).Result()
+}</span>
+
+func (r *redisCartRepo) ReleaseCheckoutLock(ctx context.Context, userID string) error <span class="cov8" title="1">{
+        key := fmt.Sprintf("checkout:%s", userID)
+        return r.rdb.Del(ctx, key).Err()
+}</span>
+
+func (r *redisCartRepo) DecrementStock(ctx context.Context, storeID, productID string, quantity int) (int64, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("stock:%s:%s", storeID, productID)
+        return r.rdb.DecrBy(ctx, key, int64(quantity)).Result()
+}</span>
+
+func (r *redisCartRepo) IncrementStock(ctx context.Context, storeID, productID string, quantity int) (int64, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("stock:%s:%s", storeID, productID)
+        return r.rdb.IncrBy(ctx, key, int64(quantity)).Result()
+}</span>
+
+func (r *redisCartRepo) GetStock(ctx context.Context, storeID, productID string) (int64, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("stock:%s:%s", storeID, productID)
+        val, err := r.rdb.Get(ctx, key).Int64()
+        if err == redis.Nil </span><span class="cov8" title="1">{
+                return 0, nil
+        }</span>
+        <span class="cov8" title="1">return val, err</span>
+}
+
+func (r *redisCartRepo) SnapshotCart(ctx context.Context, cart *model.Cart) (string, error) <span class="cov8" title="1">{
+        checkoutID := uuid.New().String()
+
+        tx, err := r.db.Begin(ctx)
+        if err != nil </span><span class="cov8" title="1">{
+                return "", err
+        }</span>
+        <span class="cov8" title="1">defer tx.Rollback(ctx)
+
+        // In a real scenario, we'd have a cart_snapshots table
+        // The requirement mentions 'snapshot cart to PostgreSQL cart_items table'
+        for _, item := range cart.Items </span><span class="cov8" title="1">{
+                _, err = tx.Exec(ctx, `
+                        INSERT INTO cart_items (checkout_id, user_id, store_id, barcode, product_id, product_name, quantity, unit_price, gst_amount, total_price)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                `, checkoutID, cart.UserID, cart.StoreID, item.Barcode, item.ProductID, item.ProductName, item.Quantity, item.UnitPrice, item.GSTAmount, item.TotalPrice)
+                if err != nil </span><span class="cov8" title="1">{
+                        return "", err
+                }</span>
+        }
+
+        <span class="cov8" title="1">if err := tx.Commit(ctx); err != nil </span><span class="cov8" title="1">{
+                return "", err
+        }</span>
+
+        <span class="cov8" title="1">return checkoutID, nil</span>
+}
+</pre>
+		
+		<pre class="file" id="file1" style="display: none">package repository
+
+import (
+        "context"
+        "encoding/json"
+        "fmt"
+        "net/http"
+        "time"
+
+        "github.com/redis/go-redis/v9"
+        "github.com/zippyra/platform/services/cart-service/internal/model"
+)
+
+type ProductRepository interface {
+        GetProductByBarcode(ctx context.Context, storeID, barcode string) (*model.Product, error)
+        GetStoreSession(ctx context.Context, userID string) (string, error)
+        GetOfferRules(ctx context.Context, storeID string) ([]model.OfferRule, error)
+}
+
+type productRepo struct {
+        rdb            *redis.Client
+        catalogService string
+        httpClient     *http.Client
+}
+
+func NewProductRepository(rdb *redis.Client, catalogServiceURL string) ProductRepository <span class="cov8" title="1">{
+        return &amp;productRepo{
+                rdb:            rdb,
+                catalogService: catalogServiceURL,
+                httpClient:     &amp;http.Client{Timeout: 2 * time.Second},
+        }
+}</span>
+
+func (r *productRepo) GetProductByBarcode(ctx context.Context, storeID, barcode string) (*model.Product, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("sku:%s:%s", storeID, barcode)
+        val, err := r.rdb.Get(ctx, key).Result()
+        if err == nil </span><span class="cov8" title="1">{
+                var p model.Product
+                if err := json.Unmarshal([]byte(val), &amp;p); err == nil </span><span class="cov8" title="1">{
+                        return &amp;p, nil
+                }</span>
+        }
+
+        // Cache miss or unmarshal error - try catalog service
+        <span class="cov8" title="1">url := fmt.Sprintf("%s/v1/catalog/barcode/%s?store_id=%s", r.catalogService, barcode, storeID)
+        req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if err != nil </span><span class="cov0" title="0">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">resp, err := r.httpClient.Do(req)
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">defer resp.Body.Close()
+
+        if resp.StatusCode == http.StatusNotFound </span><span class="cov8" title="1">{
+                return nil, nil // ErrBarcodeNotFound
+        }</span>
+        <span class="cov8" title="1">if resp.StatusCode != http.StatusOK </span><span class="cov8" title="1">{
+                return nil, fmt.Errorf("catalog service returned status: %d", resp.StatusCode)
+        }</span>
+
+        <span class="cov8" title="1">var p model.Product
+        if err := json.NewDecoder(resp.Body).Decode(&amp;p); err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">return &amp;p, nil</span>
+}
+
+func (r *productRepo) GetStoreSession(ctx context.Context, userID string) (string, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("store_session:%s", userID)
+        val, err := r.rdb.Get(ctx, key).Result()
+        if err == redis.Nil </span><span class="cov8" title="1">{
+                return "", nil
+        }</span>
+        <span class="cov8" title="1">return val, err</span>
+}
+
+func (r *productRepo) GetOfferRules(ctx context.Context, storeID string) ([]model.OfferRule, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("offer_rules:%s", storeID)
+        val, err := r.rdb.Get(ctx, key).Result()
+        if err == redis.Nil </span><span class="cov8" title="1">{
+                return nil, nil
+        }</span> else<span class="cov8" title="1"> if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">if val == "" </span><span class="cov8" title="1">{
+                return nil, nil
+        }</span>
+
+        <span class="cov8" title="1">var rules []model.OfferRule
+        if err := json.Unmarshal([]byte(val), &amp;rules); err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">return rules, nil</span>
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>

@@ -1,0 +1,692 @@
+// ============================================================
+// ZIPPYRA — TimescaleDB Schema
+// Tool: dbdiagram.io  |  Version: 1.0 Final  |  March 2026
+// All 8 hypertables: 5 Phase 0-1 + 3 Phase 3
+// ============================================================
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 0 — inventory_movements
+// Owner: Inventory Service
+// Retention: 2yr hot → S3 Glacier archive
+// Chunk interval: 1 WEEK  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table inventory_movements {
+  event_time         timestamptz   [not null, note: 'Hypertable time dimension (PK component). TimescaleDB auto-indexes.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity — UNIQUE(id, event_time)']
+  store_id           uuid          [not null, note: 'Space partition key — parallel chunk writes per store']
+  sku_id             uuid          [not null, note: 'FK → products.id']
+  delta_qty          integer       [not null, note: 'Signed: +ve = stock in, -ve = stock out/hold']
+  qty_after          integer       [not null, note: 'Snapshot of qty_available after this event — avoids cumulative SUM']
+  movement_type      varchar(30)   [not null, note: 'HOLD | RELEASE | SALE | GRN | RETURN | SHRINKAGE | TRANSFER | ADJUSTMENT']
+  reference_id       uuid          [null, note: 'order_id for SALE/HOLD | transfer_id for TRANSFER | refund_id for RETURN']
+  warehouse_id       uuid          [null, note: 'Source warehouse for GRN or TRANSFER events']
+  triggered_by       varchar(30)   [not null, note: 'CART_SCAN | CART_REMOVE | PAYMENT_CONFIRM | PAYMENT_CANCEL | GRN | RFID_RECON | MANUAL']
+  rfid_tag_id        text          [null, note: 'RFID tag scanned — populated for RFID_RECON events only']
+  user_id            uuid          [null, note: 'Customer user_id for SALE/HOLD events — NULL for system events']
+  staff_id           uuid          [null, note: 'Staff performing MANUAL adjustments — FK → users.id']
+  batch_no           text          [null, note: 'GRN batch number from warehouse — populated for GRN and TRANSFER events']
+  expiry_date        date          [null, note: 'Product expiry date for perishables — populated on GRN inwards']
+  metadata           jsonb         [null, note: 'Freeform: reason codes, PO numbers, session_id, etc.']
+  created_at         timestamptz   [not null, default: `now()`, note: 'Insert timestamp — same as event_time for real-time; may differ for replays']
+
+  indexes {
+    (event_time, id)              [pk, name: 'inventory_movements_pkey']
+    (store_id, event_time)        [name: 'idx_inv_store_time']
+    (sku_id, event_time)          [name: 'idx_inv_sku_time']
+    (movement_type, event_time)   [name: 'idx_inv_type_time']
+    (triggered_by, event_time)    [name: 'idx_inv_trigger_time']
+    reference_id                  [name: 'idx_inv_ref']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 WEEK
+  Space partition: store_id (4 partitions)
+  Compression    : after 6 months (segmentby: store_id,movement_type | orderby: event_time DESC)
+  Retention      : 24 months hot → S3 Glacier
+  Writer         : Inventory Service (direct write, synchronous)
+  Consumers      : Analytics Service, ClickHouse (via cagg inv_hourly_stock, inv_daily_shrinkage, inv_weekly_movement)
+
+  Continuous Aggregates:
+    inv_hourly_stock    — 1hr bucket — store_id,sku_id — SUM(delta_qty), MIN/MAX(qty_after)
+    inv_daily_shrinkage — 1day bucket — store_id,sku_id — SUM WHERE movement_type=SHRINKAGE
+    inv_weekly_movement — 1wk bucket — store_id — COUNT(*), SUM(ABS(delta_qty)) by type
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 1 — rfid_scan_events
+// Owner: Exit Validation Service
+// Retention: 2yr hot → S3 Glacier archive
+// Chunk interval: 1 DAY  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table rfid_scan_events {
+  scanned_at         timestamptz   [not null, note: 'Hypertable time dimension (PK component). High burst: 50–200 tags/sec at peak.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — FK → stores.id']
+  gate_id            text          [not null, note: 'Physical gate identifier e.g. GATE_01']
+  rfid_tag_id        text          [not null, note: 'EPC tag code read by antenna']
+  order_id           uuid          [null, note: 'Matched order — NULL if tag not in any active order']
+  order_item_id      uuid          [null, note: 'Matched order_items.id row']
+  scan_result        varchar(20)   [not null, note: 'MATCHED | UNMATCHED | DUPLICATE | ALREADY_EXITED']
+  signal_strength    smallint      [null, note: 'RSSI dBm from antenna — filter ghost reads below threshold']
+  antenna_id         text          [null, note: 'Antenna within gate (gates may have multiple antennas)']
+  session_id         uuid          [null, note: 'Exit session — groups multiple tags into one gate pass']
+  user_id            uuid          [null, note: 'Customer exiting — FK → users.id. NULL if tag not matched to any user.']
+  conveyor_belt_id   text          [null, note: 'Phase 3: conveyor RFID belt identifier — NULL for gate scans']
+  metadata           jsonb         [null, note: 'Raw MQTT payload fields — vendor-specific data']
+
+  indexes {
+    (scanned_at, id)                        [pk, name: 'rfid_scan_events_pkey']
+    (store_id, gate_id, scanned_at)         [name: 'idx_rfid_store_gate']
+    (rfid_tag_id, scanned_at)               [name: 'idx_rfid_tag']
+    (order_id, scanned_at)                  [name: 'idx_rfid_order']
+    (scan_result, scanned_at)               [name: 'idx_rfid_result']
+    (user_id, scanned_at)                   [name: 'idx_rfid_user_time']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 DAY (high-frequency MQTT ingest)
+  Space partition: store_id (4 partitions)
+  Compression    : after 7 days (segmentby: store_id,gate_id | orderby: scanned_at DESC)
+  Retention      : 24 months hot → S3 Glacier
+  Writer         : Exit Validation Service (direct write from MQTT handler)
+  Consumers      : Exit Validation (RFID reconcile against order_items), Analytics Service
+
+  Continuous Aggregates:
+    rfid_gate_hourly    — 1hr bucket — store_id,gate_id — COUNT(*), COUNT WHERE scan_result=UNMATCHED
+    rfid_daily_mismatch — 1day bucket — store_id — COUNT WHERE UNMATCHED → feeds ClickHouse shrinkage_signals
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 0 — cart_scan_events
+// Owner: Cart Service (analytics feed)
+// Retention: 1yr hot → S3 Standard archive
+// Chunk interval: 1 WEEK  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table cart_scan_events {
+  scanned_at         timestamptz   [not null, note: 'Hypertable time dimension (PK component). May be backfilled from WatermelonDB offline scan_buffer.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — store where scan occurred']
+  user_id            uuid          [not null, note: 'Customer who scanned — FK → users.id']
+  sku_id             uuid          [not null, note: 'Product scanned — FK → products.id']
+  session_id         uuid          [not null, note: 'Store session (store-scoped JWT session identifier)']
+  session_start_at   timestamptz   [null, note: 'Session start time — enables scan-to-purchase funnel duration in ClickHouse user_behavior_sessions']
+  scan_source        varchar(20)   [not null, note: 'CAMERA | OFFLINE_BUFFER | STAFF_KIOSK']
+  price_at_scan      numeric(10,2) [not null, note: 'Price served at scan time — detects price-change discrepancies']
+  offer_applied      uuid          [null, note: 'Offer ID applied at scan time — FK → offers.id']
+  added_to_cart      boolean       [not null, note: 'FALSE = scanned but duplicate — not added to cart']
+  device_id          text          [null, note: 'Device fingerprint for fraud analytics']
+  network_latency_ms integer       [null, note: 'API latency experienced by client at scan time (ms)']
+  synced_at          timestamptz   [null, note: 'Non-null = offline scan synced from WatermelonDB scan_buffer']
+  metadata           jsonb         [null, note: 'MLKit confidence score, barcode type (QR/EAN/UPC), scan attempt count']
+
+  indexes {
+    (scanned_at, id)              [pk, name: 'cart_scan_events_pkey']
+    (store_id, scanned_at)        [name: 'idx_cart_store_time']
+    (user_id, scanned_at)         [name: 'idx_cart_user_time']
+    (sku_id, scanned_at)          [name: 'idx_cart_sku_time']
+    (session_id, scanned_at)      [name: 'idx_cart_session']
+    (added_to_cart, scanned_at)   [name: 'idx_cart_conversion']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 WEEK
+  Space partition: store_id (4 partitions)
+  Compression    : after 6 months (segmentby: store_id,scan_source | orderby: scanned_at DESC)
+  Retention      : 12 months hot → S3 Standard
+  Writer         : Cart Service — Kafka consumer on cart.item_scanned topic (async write)
+  Consumers      : Analytics Service, Elasticsearch (trending_skus_{store_id} via cagg)
+
+  Continuous Aggregates:
+    cart_scans_hourly  — 1hr bucket — store_id,sku_id — COUNT(*), COUNT WHERE added_to_cart → trending SKUs
+    cart_scans_daily   — 1day bucket — store_id — COUNT(DISTINCT user_id), COUNT(*) → daily active shoppers
+    scan_funnel_daily  — 1day bucket — store_id,scan_source — COUNT(*), AVG(network_latency_ms)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 0 — payment_analytics_events
+// Owner: Payment Service (analytics feed)
+// Retention: 5yr hot (compliance — RBI/SEBI)
+// Chunk interval: 1 MONTH  |  Space partition: gateway
+// NOTE: Renamed from payment_events to resolve naming conflict
+//       with PostgreSQL audit table payment_audit_log
+// ─────────────────────────────────────────────────────────────
+Table payment_analytics_events {
+  event_time         timestamptz   [not null, note: 'Hypertable time dimension (PK component). 5yr compliance retention.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  payment_id         uuid          [not null, note: 'FK → payments.id (PostgreSQL OLTP table)']
+  cart_id            uuid          [null, note: 'Cart being paid for — used for idempotency tracing and cart→payment funnel analytics']
+  order_id           uuid          [null, note: 'Populated after order.created event — FK → orders.id']
+  user_id            uuid          [not null, note: 'Customer — FK → users.id']
+  store_id           uuid          [not null, note: 'Store context — FK → stores.id']
+  gateway            varchar(20)   [not null, note: 'Space partition key — RAZORPAY | CASHFREE | PAYU']
+  payment_method     varchar(20)   [not null, note: 'UPI | CARD | WALLET | SPLIT']
+  event_type         varchar(30)   [not null, note: 'INITIATED | PENDING | CONFIRMED | FAILED | CANCELLED | WEBHOOK_RECEIVED | RETRY']
+  amount             numeric(12,2) [not null, note: 'Transaction amount in INR']
+  gateway_latency_ms integer       [null, note: 'Time from initiation to gateway ACK (ms)']
+  total_latency_ms   integer       [null, note: 'End-to-end from user tap to payment confirmation (ms)']
+  attempt_number     smallint      [not null, default: 1, note: 'Which retry attempt (1–3 max across gateways)']
+  error_code         text          [null, note: 'Gateway error code on FAILED events']
+  idempotency_key    text          [null, note: 'SHA-256(user_id+cart_id+timestamp_minute) — detect duplicate calls']
+  metadata           jsonb         [null, note: 'Gateway response payload, webhook signature hash, raw PSP response']
+
+  indexes {
+    (event_time, id)              [pk, name: 'payment_analytics_events_pkey']
+    (payment_id, event_time)      [name: 'idx_pay_payment_time']
+    (store_id, event_time)        [name: 'idx_pay_store_time']
+    (gateway, event_time)         [name: 'idx_pay_gateway_time']
+    (event_type, event_time)      [name: 'idx_pay_type_time']
+    (user_id, event_time)         [name: 'idx_pay_user_time']
+    (cart_id, event_time)         [name: 'idx_pay_cart_time']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 MONTH (compliance-grade; month-aligned for audit reports)
+  Space partition: gateway (3 partitions: RAZORPAY, CASHFREE, PAYU)
+  Compression    : after 13 months (segmentby: gateway,payment_method | orderby: event_time DESC)
+  Retention      : 60 months — NEVER auto-dropped (RBI/SEBI compliance)
+  Writer         : Payment Service — Kafka consumers on payment.initiated, payment.confirmed, payment.failed
+  Consumers      : Analytics Service, Reconciliation Service
+                   Cagg payment_gateway_5min → Redis gateway_health:{gw_name}
+
+  ⚠ NAMING CONFLICT RESOLVED:
+    This table was originally named payment_events in Section 4.3.
+    Renamed to payment_analytics_events to avoid collision with
+    PostgreSQL append-only audit table payment_audit_log.
+
+  Continuous Aggregates:
+    payment_gateway_5min   — 5min bucket — gateway — COUNT(*), AVG(latency), success_rate → Redis gateway_health
+    payment_daily_summary  — 1day bucket — store_id,gateway — COUNT(*), SUM(amount) → ClickHouse sales_summary
+    payment_hourly_method  — 1hr bucket — payment_method — COUNT(*), AVG(total_latency_ms)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 1 — store_traffic
+// Owner: Store Service
+// Retention: 1yr hot → S3 Standard archive
+// Chunk interval: 1 WEEK  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table store_traffic {
+  recorded_at        timestamptz   [not null, note: 'Hypertable time dimension (PK component). Written on every entry/exit event and periodic snapshots.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — FK → stores.id']
+  event_type         varchar(25)   [not null, note: 'ENTRY | EXIT | SNAPSHOT | CAPACITY_ALERT']
+  current_count      integer       [not null, note: 'Occupancy headcount at this exact moment']
+  max_capacity       integer       [not null, note: "Store's configured max_capacity at time of record"]
+  occupancy_pct      numeric(5,2)  [not null, note: 'current_count / max_capacity * 100 — computed on insert']
+  entry_delta        smallint      [not null, default: 0, note: '+1 for ENTRY | -1 for EXIT | 0 for SNAPSHOT/ALERT']
+  dwell_time_seconds integer       [null, note: 'Time between matched entry and exit for same user session (seconds). NULL for SNAPSHOT/ALERT events.']
+  queue_length       smallint      [not null, default: 0, note: 'Virtual queue depth at moment of CAPACITY_ALERT — 0 otherwise']
+  trigger_source     varchar(25)   [null, note: 'GATE_SENSOR | MANUAL | SCHEDULED_SNAPSHOT | BLE_ESTIMATE']
+  user_id            uuid          [null, note: 'Customer user_id — populated for ENTRY/EXIT events; NULL for aggregate SNAPSHOT']
+  session_id         uuid          [null, note: 'Store session ID — correlates with cart_scan_events.session_id for end-to-end funnel']
+  metadata           jsonb         [null, note: 'Gate ID, BLE beacon count, sensor ID, etc.']
+
+  indexes {
+    (recorded_at, id)             [pk, name: 'store_traffic_pkey']
+    (store_id, recorded_at)       [name: 'idx_traffic_store_time']
+    (event_type, recorded_at)     [name: 'idx_traffic_type_time']
+    (store_id, event_type, recorded_at) [name: 'idx_traffic_store_event']
+    (session_id, recorded_at)           [name: 'idx_traffic_session']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 WEEK
+  Space partition: store_id (4 partitions)
+  Compression    : after 6 months (segmentby: store_id,event_type | orderby: recorded_at DESC)
+  Retention      : 12 months hot → S3 Standard
+  Writer         : Store Service (direct write — periodic snapshot every 15min + entry/exit events)
+                   Also consumes Kafka topic store.session_started to record session-bound ENTRY events
+  Consumers      : Analytics Service, ClickHouse peak_hour_heatmap
+
+  Continuous Aggregates:
+    traffic_15min  — 15min bucket — store_id — AVG(current_count), MAX(occupancy_pct) → Redis store_capacity
+    traffic_hourly — 1hr bucket — store_id — AVG(occupancy_pct), SUM(entry_delta>0) → ClickHouse heatmap
+    traffic_daily  — 1day bucket — store_id — MAX(current_count), total_entries, AVG(dwell_time_seconds)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 3 — conveyor_rfid_events
+// Owner: Exit Validation Service
+// Retention: 2yr hot → S3 Glacier archive
+// Chunk interval: 1 DAY  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table conveyor_rfid_events {
+  scanned_at         timestamptz   [not null, note: 'Hypertable time dimension (PK component). Extremely high frequency: 500+ tags/sec at conveyor speed.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — FK → stores.id']
+  belt_id            text          [not null, note: 'Conveyor belt identifier e.g. BELT_01']
+  rfid_tag_id        text          [not null, note: 'EPC tag code read by antenna']
+  order_id           uuid          [null, note: 'Matched active order — NULL if tag unrecognised']
+  order_item_id      uuid          [null, note: 'Matched order_items.id row']
+  belt_speed_mps     numeric(4,2)  [null, note: 'Conveyor belt speed in metres per second at scan time']
+  scan_result        varchar(20)   [not null, note: 'MATCHED | UNMATCHED | GHOST_READ']
+  antenna_id         text          [null, note: 'Specific antenna on the belt that captured the tag']
+  session_id         uuid          [null, note: 'Exit session grouping all tags from one customer pass']
+  user_id            uuid          [null, note: 'Customer exiting — FK → users.id. NULL if tag unmatched.']
+  metadata           jsonb         [null, note: 'Raw MQTT payload — vendor-specific belt reader data']
+
+  indexes {
+    (scanned_at, id)              [pk, name: 'conveyor_rfid_events_pkey']
+    (store_id, belt_id, scanned_at) [name: 'idx_conv_store_belt']
+    (rfid_tag_id, scanned_at)     [name: 'idx_conv_tag']
+    (order_id, scanned_at)        [name: 'idx_conv_order']
+    (scan_result, scanned_at)     [name: 'idx_conv_result']
+    (user_id, scanned_at)         [name: 'idx_conv_user_time']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB (Phase 3 — Months 13–18)
+  Chunk interval : 1 DAY (even higher frequency than gate rfid_scan_events)
+  Space partition: store_id (4 partitions)
+  Compression    : after 7 days (segmentby: store_id,belt_id | orderby: scanned_at DESC)
+  Retention      : 24 months hot → S3 Glacier
+  Writer         : Exit Validation Service — MQTT handler for zippyra/exit/{store_id}/conveyor/scan
+  Consumers      : Analytics Service (fraud/shrinkage ML model)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 3 — fraud_signals
+// Owner: Analytics Service (ML pipeline)
+// Retention: 3yr hot → S3 Standard archive
+// Chunk interval: 1 WEEK  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table fraud_signals {
+  detected_at        timestamptz   [not null, note: 'Hypertable time dimension (PK component). Written by ML pipeline when anomaly detected.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — FK → stores.id']
+  user_id            uuid          [null, note: 'User-level signal: FK → users.id. NULL for store-level signals.']
+  signal_type        varchar(40)   [not null, note: 'EXIT_MISMATCH | UNUSUAL_SCAN_PATTERN | REPEAT_RFID_FAIL | PRICE_TAMPER | SCAN_SPEED_ANOMALY']
+  severity           varchar(10)   [not null, note: 'LOW | MEDIUM | HIGH | CRITICAL']
+  score              numeric(5,4)  [not null, note: 'ML model confidence score 0.0000–1.0000']
+  reference_id       uuid          [null, note: 'Triggering entity: order_id | exit_token_id | payment_id']
+  reference_type     varchar(20)   [null, note: 'ORDER | EXIT_TOKEN | PAYMENT — disambiguates reference_id']
+  feature_vector     jsonb         [not null, note: 'ML input features used to generate this signal — required for model retraining']
+  model_version      text          [not null, note: 'ML model version tag e.g. fraud-v2.1.3']
+  actioned           boolean       [not null, default: false, note: 'TRUE when staff reviewed or system auto-actioned']
+  actioned_at        timestamptz   [null, note: 'When actioned was set TRUE']
+  actioned_by        uuid          [null, note: 'Staff user_id who reviewed — NULL for auto-actioned']
+  metadata           jsonb         [null, note: 'Raw context, alert payload, supporting evidence']
+
+  indexes {
+    (detected_at, id)             [pk, name: 'fraud_signals_pkey']
+    (store_id, detected_at)       [name: 'idx_fraud_store_time']
+    (user_id, detected_at)        [name: 'idx_fraud_user_time']
+    (severity, detected_at)       [name: 'idx_fraud_severity']
+    (signal_type, detected_at)    [name: 'idx_fraud_type']
+    (actioned, detected_at)       [name: 'idx_fraud_unactioned']
+    (score, detected_at)          [name: 'idx_fraud_score']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB (Phase 3 — Months 13–18)
+  Chunk interval : 1 WEEK
+  Space partition: store_id (4 partitions)
+  Compression    : after 6 months (segmentby: store_id,signal_type | orderby: detected_at DESC)
+  Retention      : 36 months hot → S3 Standard (ML training data)
+  Writer         : Analytics Service (ML feature pipeline — direct write)
+  Consumers      : Analytics Service (fraud model inference), Support Service (CRITICAL alerts)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 3 — supply_chain_events
+// Owner: Warehouse Service
+// Retention: 2yr hot → S3 Standard archive
+// Chunk interval: 1 WEEK  |  Space partition: warehouse_id
+// ─────────────────────────────────────────────────────────────
+Table supply_chain_events {
+  event_time         timestamptz   [not null, note: 'Hypertable time dimension (PK component). Written on every supply chain state transition.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  warehouse_id       uuid          [not null, note: 'Space partition key — FK → warehouse_stock.warehouse_id']
+  store_id           uuid          [null, note: 'Destination store — NULL for warehouse-only events. FK → stores.id']
+  event_type         varchar(30)   [not null, note: 'GRN_RECEIVED | DISPATCH | RETURN | DAMAGE | DELAY | COLD_CHAIN_BREACH']
+  sku_id             uuid          [not null, note: 'Product involved — FK → products.id']
+  qty                integer       [not null, note: 'Quantity in this event (always positive)']
+  expected_at        timestamptz   [null, note: 'For DELAY detection: when the delivery was expected']
+  actual_at          timestamptz   [null, note: 'For DELAY detection: when it actually arrived']
+  delay_minutes      integer       [null, note: 'Computed: EXTRACT(EPOCH FROM (actual_at - expected_at)) / 60']
+  anomaly_score      numeric(5,4)  [null, note: 'ML anomaly score 0.0000–1.0000 — populated by Analytics Service']
+  po_number          text          [null, note: 'Purchase order reference number']
+  vendor_id          uuid          [null, note: 'Supplier/vendor identifier']
+  temperature_c      numeric(5,2)  [null, note: 'Temperature at time of event — for cold chain events']
+  metadata           jsonb         [null, note: 'Vendor name, vehicle number, GRN document URL, sensor readings']
+
+  indexes {
+    (event_time, id)              [pk, name: 'supply_chain_events_pkey']
+    (warehouse_id, event_time)    [name: 'idx_sc_warehouse_time']
+    (store_id, event_time)        [name: 'idx_sc_store_time']
+    (sku_id, event_time)          [name: 'idx_sc_sku_time']
+    (event_type, event_time)      [name: 'idx_sc_type_time']
+    (po_number)                   [name: 'idx_sc_po']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB (Phase 3 — Months 13–18)
+  Chunk interval : 1 WEEK
+  Space partition: warehouse_id (varies by deployment)
+  Compression    : after 6 months (segmentby: warehouse_id,event_type | orderby: event_time DESC)
+  Retention      : 24 months hot → S3 Standard
+  Writer         : Warehouse Service (direct write on every supply chain state change)
+  Consumers      : Analytics Service (supply chain anomaly detection model)
+  '''
+}
+
+
+// ============================================================
+// CONTINUOUS AGGREGATE VIEWS (TimescaleDB Materialized Views)
+// These are real queryable views in TimescaleDB — shown as
+// tables in dbdiagram.io for full visibility.
+// Refresh policies run automatically per bucket interval.
+// ============================================================
+
+// ── inventory_movements caggs ────────────────────────────────
+Table inv_hourly_stock [note: 'Cagg — inventory_movements — 1hr bucket — refreshed continuously'] {
+  bucket        timestamptz [not null, note: 'time_bucket(1hr, event_time)']
+  store_id      uuid        [not null]
+  sku_id        uuid        [not null]
+  total_delta   integer     [not null, note: 'SUM(delta_qty)']
+  min_qty_after integer     [not null, note: 'MIN(qty_after)']
+  max_qty_after integer     [not null, note: 'MAX(qty_after)']
+  indexes { (bucket, store_id, sku_id) [pk] }
+}
+
+Table inv_daily_shrinkage [note: 'Cagg — inventory_movements — 1day bucket — feeds ClickHouse shrinkage_signals'] {
+  bucket           timestamptz [not null, note: 'time_bucket(1day, event_time)']
+  store_id         uuid        [not null]
+  sku_id           uuid        [not null]
+  shrinkage_qty    integer     [not null, note: 'SUM(delta_qty) WHERE movement_type = SHRINKAGE']
+  shrinkage_events integer     [not null, note: 'COUNT(*) WHERE movement_type = SHRINKAGE']
+  indexes { (bucket, store_id, sku_id) [pk] }
+}
+
+Table inv_weekly_movement [note: 'Cagg — inventory_movements — 1wk bucket — warehouse planning'] {
+  bucket         timestamptz [not null, note: 'time_bucket(1wk, event_time)']
+  store_id       uuid        [not null]
+  movement_type  varchar(30) [not null]
+  event_count    integer     [not null, note: 'COUNT(*)']
+  total_abs_qty  integer     [not null, note: 'SUM(ABS(delta_qty))']
+  indexes { (bucket, store_id, movement_type) [pk] }
+}
+
+// ── rfid_scan_events caggs ───────────────────────────────────
+Table rfid_gate_hourly [note: 'Cagg — rfid_scan_events — 1hr bucket — gate health monitoring'] {
+  bucket           timestamptz [not null, note: 'time_bucket(1hr, scanned_at)']
+  store_id         uuid        [not null]
+  gate_id          text        [not null]
+  total_scans      integer     [not null, note: 'COUNT(*)']
+  unmatched_scans  integer     [not null, note: 'COUNT(*) WHERE scan_result = UNMATCHED']
+  unmatched_rate   numeric(5,4)[not null, note: 'unmatched_scans / total_scans — alert if > 0.05']
+  indexes { (bucket, store_id, gate_id) [pk] }
+}
+
+Table rfid_daily_mismatch [note: 'Cagg — rfid_scan_events — 1day bucket — feeds ClickHouse shrinkage_signals'] {
+  bucket           timestamptz [not null, note: 'time_bucket(1day, scanned_at)']
+  store_id         uuid        [not null]
+  total_scans      integer     [not null]
+  unmatched_count  integer     [not null]
+  unmatched_rate   numeric(5,4)[not null]
+  indexes { (bucket, store_id) [pk] }
+}
+
+// ── cart_scan_events caggs ───────────────────────────────────
+Table cart_scans_hourly [note: 'Cagg — cart_scan_events — 1hr bucket — trending SKUs → Elasticsearch'] {
+  bucket          timestamptz [not null, note: 'time_bucket(1hr, scanned_at)']
+  store_id        uuid        [not null]
+  sku_id          uuid        [not null]
+  total_scans     integer     [not null, note: 'COUNT(*)']
+  added_to_cart   integer     [not null, note: 'COUNT(*) WHERE added_to_cart = TRUE']
+  conversion_rate numeric(5,4)[not null, note: 'added_to_cart / total_scans']
+  indexes { (bucket, store_id, sku_id) [pk] }
+}
+
+Table cart_scans_daily [note: 'Cagg — cart_scan_events — 1day bucket — daily active shoppers per store'] {
+  bucket         timestamptz [not null, note: 'time_bucket(1day, scanned_at)']
+  store_id       uuid        [not null]
+  unique_users   integer     [not null, note: 'COUNT(DISTINCT user_id)']
+  total_scans    integer     [not null, note: 'COUNT(*)']
+  indexes { (bucket, store_id) [pk] }
+}
+
+Table scan_funnel_daily [note: 'Cagg — cart_scan_events — 1day bucket — offline vs online ratio'] {
+  bucket              timestamptz [not null, note: 'time_bucket(1day, scanned_at)']
+  store_id            uuid        [not null]
+  scan_source         varchar(20) [not null]
+  total_scans         integer     [not null]
+  avg_latency_ms      numeric(8,2)[null,     note: 'AVG(network_latency_ms)']
+  indexes { (bucket, store_id, scan_source) [pk] }
+}
+
+// ── payment_analytics_events caggs ───────────────────────────
+Table payment_gateway_5min [note: 'Cagg — payment_analytics_events — 5min bucket — feeds Redis gateway_health:{gw_name}'] {
+  bucket          timestamptz  [not null, note: 'time_bucket(5min, event_time)']
+  gateway         varchar(20)  [not null, note: 'RAZORPAY | CASHFREE | PAYU']
+  total_events    integer      [not null, note: 'COUNT(*)']
+  confirmed_count integer      [not null, note: 'COUNT(*) WHERE event_type = CONFIRMED']
+  failed_count    integer      [not null, note: 'COUNT(*) WHERE event_type = FAILED']
+  success_rate    numeric(5,4) [not null, note: 'confirmed_count / (confirmed_count + failed_count)']
+  avg_latency_ms  numeric(8,2) [null,     note: 'AVG(gateway_latency_ms)']
+  indexes { (bucket, gateway) [pk] }
+}
+
+Table payment_daily_summary [note: 'Cagg — payment_analytics_events — 1day bucket — feeds ClickHouse sales_summary'] {
+  bucket          timestamptz  [not null, note: 'time_bucket(1day, event_time)']
+  store_id        uuid         [not null]
+  gateway         varchar(20)  [not null]
+  transaction_count integer    [not null]
+  total_amount    numeric(14,2)[not null, note: 'SUM(amount) WHERE event_type = CONFIRMED']
+  success_rate    numeric(5,4) [not null]
+  indexes { (bucket, store_id, gateway) [pk] }
+}
+
+Table payment_hourly_method [note: 'Cagg — payment_analytics_events — 1hr bucket — UPI vs Card vs Wallet split'] {
+  bucket           timestamptz  [not null, note: 'time_bucket(1hr, event_time)']
+  payment_method   varchar(20)  [not null]
+  transaction_count integer     [not null]
+  avg_latency_ms   numeric(8,2) [null]
+  indexes { (bucket, payment_method) [pk] }
+}
+
+// ── store_traffic caggs ──────────────────────────────────────
+Table traffic_15min [note: 'Cagg — store_traffic — 15min bucket — feeds Redis store_capacity:{store_id}. Writer: store.session_started Kafka event consumed by Store Service.'] {
+  bucket            timestamptz  [not null, note: 'time_bucket(15min, recorded_at)']
+  store_id          uuid         [not null, note: 'FK → store_traffic.store_id']
+  avg_occupancy     integer      [not null, note: 'AVG(current_count)']
+  max_occupancy_pct numeric(5,2) [not null, note: 'MAX(occupancy_pct)']
+  indexes { (bucket, store_id) [pk] }
+}
+
+Table traffic_hourly [note: 'Cagg — store_traffic — 1hr bucket — feeds ClickHouse peak_hour_heatmap'] {
+  bucket           timestamptz  [not null, note: 'time_bucket(1hr, recorded_at)']
+  store_id         uuid         [not null]
+  avg_occupancy_pct numeric(5,2)[not null]
+  total_entries    integer      [not null, note: 'SUM(entry_delta) WHERE entry_delta > 0']
+  indexes { (bucket, store_id) [pk] }
+}
+
+Table traffic_daily [note: 'Cagg — store_traffic — 1day bucket — peak occupancy + dwell time'] {
+  bucket            timestamptz  [not null, note: 'time_bucket(1day, recorded_at)']
+  store_id          uuid         [not null]
+  max_count         integer      [not null, note: 'MAX(current_count)']
+  total_entries     integer      [not null]
+  avg_dwell_seconds integer      [null,     note: 'AVG(dwell_time_seconds)']
+  indexes { (bucket, store_id) [pk] }
+}
+
+
+// ============================================================
+// RELATIONSHIPS — FK references across Zippyra services
+// Note: TimescaleDB tables reference PostgreSQL tables.
+//       These are logical FKs (enforced in application layer,
+//       NOT as DB-level constraints on TimescaleDB hypertables).
+// ============================================================
+
+// inventory_movements
+Ref: inventory_movements.store_id      > stores.id
+Ref: inventory_movements.sku_id        > products.id
+Ref: inventory_movements.user_id       > users.id
+Ref: inventory_movements.staff_id      > users.id
+Ref: inventory_movements.warehouse_id  > warehouse_stock.warehouse_id
+
+// rfid_scan_events
+Ref: rfid_scan_events.store_id         > stores.id
+Ref: rfid_scan_events.order_id         > orders.id
+Ref: rfid_scan_events.order_item_id    > order_items.id
+Ref: rfid_scan_events.user_id          > users.id
+
+// cart_scan_events
+Ref: cart_scan_events.store_id         > stores.id
+Ref: cart_scan_events.user_id          > users.id
+Ref: cart_scan_events.sku_id           > products.id
+Ref: cart_scan_events.offer_applied    > offers.id
+
+// payment_analytics_events
+Ref: payment_analytics_events.payment_id > payments.id
+Ref: payment_analytics_events.order_id   > orders.id
+Ref: payment_analytics_events.user_id    > users.id
+Ref: payment_analytics_events.store_id   > stores.id
+
+// store_traffic
+Ref: store_traffic.store_id            > stores.id
+Ref: store_traffic.user_id             > users.id
+
+// conveyor_rfid_events
+Ref: conveyor_rfid_events.store_id     > stores.id
+Ref: conveyor_rfid_events.order_id     > orders.id
+Ref: conveyor_rfid_events.order_item_id > order_items.id
+Ref: conveyor_rfid_events.user_id      > users.id
+
+// fraud_signals
+Ref: fraud_signals.store_id            > stores.id
+Ref: fraud_signals.user_id             > users.id
+Ref: fraud_signals.actioned_by         > users.id
+
+// supply_chain_events
+Ref: supply_chain_events.store_id      > stores.id
+Ref: supply_chain_events.sku_id        > products.id
+Ref: supply_chain_events.warehouse_id  > warehouse_stock.warehouse_id
+Ref: supply_chain_events.vendor_id     > vendors.id
+
+// continuous aggregate → source hypertable
+Ref: inv_hourly_stock.store_id         > inventory_movements.store_id
+Ref: inv_daily_shrinkage.store_id      > inventory_movements.store_id
+Ref: inv_weekly_movement.store_id      > inventory_movements.store_id
+Ref: rfid_gate_hourly.store_id         > rfid_scan_events.store_id
+Ref: rfid_daily_mismatch.store_id      > rfid_scan_events.store_id
+Ref: cart_scans_hourly.store_id        > cart_scan_events.store_id
+Ref: cart_scans_daily.store_id         > cart_scan_events.store_id
+Ref: scan_funnel_daily.store_id        > cart_scan_events.store_id
+Ref: payment_gateway_5min.bucket       > payment_analytics_events.event_time
+Ref: payment_daily_summary.store_id    > payment_analytics_events.store_id
+Ref: payment_hourly_method.bucket      > payment_analytics_events.event_time
+Ref: traffic_15min.store_id            > store_traffic.store_id
+Ref: traffic_hourly.store_id           > store_traffic.store_id
+Ref: traffic_daily.store_id            > store_traffic.store_id
+
+// stub table internal refs
+Ref: payment_audit_log.payment_id      > payments.id
+Ref: transfers.to_store_id             > stores.id
+Ref: transfers.sku_id                  > products.id
+Ref: transfers.from_warehouse_id       > warehouse_stock.warehouse_id
+Ref: orders.user_id                    > users.id
+Ref: order_items.order_id              > orders.id
+Ref: order_items.sku_id                > products.id
+Ref: payments.order_id                 > orders.id
+Ref: warehouse_stock.sku_id            > products.id
+
+// cagg sku_id refs
+Ref: inv_hourly_stock.sku_id           > products.id
+Ref: inv_daily_shrinkage.sku_id        > products.id
+Ref: cart_scans_hourly.sku_id          > products.id
+
+
+// ============================================================
+// REFERENCED POSTGRESQL TABLES (stub — owned by other services)
+// These exist in the PostgreSQL OLTP layer — included here
+// so dbdiagram.io can render the full relationship graph.
+// ============================================================
+
+Table users [note: 'Auth Service — PostgreSQL'] {
+  id    uuid [pk]
+  phone text [not null]
+}
+
+Table stores [note: 'Store Service — PostgreSQL'] {
+  id   uuid [pk]
+  name text [not null]
+}
+
+Table products [note: 'Catalog Service — PostgreSQL'] {
+  id      uuid [pk]
+  barcode text [not null]
+}
+
+Table orders [note: 'Order Service — PostgreSQL'] {
+  id      uuid [pk]
+  user_id uuid [not null]
+}
+
+Table order_items [note: 'Order Service — PostgreSQL'] {
+  id         uuid [pk]
+  order_id   uuid [not null]
+  sku_id     uuid [not null]
+}
+
+Table payments [note: 'Payment Service — PostgreSQL'] {
+  id       uuid [pk]
+  order_id uuid [not null]
+}
+
+Table offers [note: 'Catalog Service — PostgreSQL'] {
+  id   uuid [pk]
+  type text [not null]
+}
+
+Table warehouse_stock [note: 'Warehouse Service — PostgreSQL'] {
+  warehouse_id  uuid [not null, note: 'Composite PK component — warehouse identifier']
+  sku_id        uuid [not null, note: 'Composite PK component — FK → products.id']
+  qty_available integer [not null]
+  batch_no      text [null]
+  expiry        date [null]
+
+  indexes {
+    (warehouse_id, sku_id) [pk]
+  }
+}
+
+Table vendors [note: 'Warehouse Service — PostgreSQL (Phase 3)'] {
+  id   uuid [pk]
+  name text [not null]
+  gstin text [null, note: 'GST Identification Number — India compliance']
+}
+
+Table payment_audit_log [note: 'Payment Service — PostgreSQL append-only audit table. SEPARATE from payment_analytics_events (TimescaleDB). Immutable compliance record. Forever retention.'] {
+  id           uuid        [pk]
+  payment_id   uuid        [not null]
+  event_type   varchar(30) [not null, note: 'INITIATED | CONFIRMED | FAILED | REFUNDED | DISPUTED']
+  amount       numeric(12,2)[not null]
+  gateway      varchar(20) [not null]
+  performed_at timestamptz [not null]
+  metadata     jsonb       [null]
+}
+
+Table transfers [note: 'Warehouse Service — PostgreSQL. Referenced by inventory_movements.reference_id for TRANSFER events.'] {
+  id               uuid        [pk]
+  sku_id           uuid        [not null]
+  from_warehouse_id uuid       [not null]
+  to_store_id      uuid        [not null]
+  qty              integer     [not null]
+  dispatched_at    timestamptz [not null]
+  status           varchar(20) [not null, note: 'PENDING | IN_TRANSIT | RECEIVED | CANCELLED']
+}
+

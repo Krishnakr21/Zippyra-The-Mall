@@ -1,0 +1,11 @@
+{
+  "title": "Pilot Store Health",
+  "tags": ["zippyra", "store"],
+  "panels": [
+    { "type": "timeseries", "title": "Active Customers per Store", "targets": [{"expr": "sum by(store_id) (store_active_customers)"}] },
+    { "type": "timeseries", "title": "Store Entry Rate", "targets": [{"expr": "rate(store_entries_total[5m])"}] },
+    { "type": "timeseries", "title": "Exit Gate Success Rate", "targets": [{"expr": "sum(rate(exit_gate_success_total[5m])) / sum(rate(exit_gate_attempts_total[5m]))"}] },
+    { "type": "timeseries", "title": "Cart Scan Rate", "targets": [{"expr": "rate(cart_item_scanned_total[5m])"}] },
+    { "type": "timeseries", "title": "Device Heartbeat Status", "targets": [{"expr": "device_online_status"}] }
+  ]
+}

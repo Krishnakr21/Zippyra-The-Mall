@@ -1,0 +1,54 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 9 — EXIT VALIDATION SERVICE
+// Tables: exit_tokens, override_log
+// =============================================================================
+
+Table exit_tokens {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  order_id        uuid          [not null, ref: > orders.id]
+  token_hash      varchar(255)  [unique, not null, note: 'Hashed exit QR token']
+  created_at      timestamptz   [not null, default: `now()`]
+  expires_at      timestamptz   [not null, note: 'Short TTL — typically 30 minutes from order confirmation']
+  status          varchar(20)   [not null, default: 'VALID', note: 'VALID → USED | EXPIRED | DENIED']
+  used_at         timestamptz   [null, note: 'Set when customer exits through gate']
+  gate_id         varchar(50)   [null, note: 'Which physical gate was used for exit']
+
+  indexes {
+    order_id       [name: 'idx_exit_tokens_order_id']
+    token_hash     [unique, name: 'uq_exit_tokens_hash']
+    status         [name: 'idx_exit_tokens_status']
+    expires_at     [name: 'idx_exit_tokens_expires_at']
+    created_at     [name: 'idx_exit_tokens_created_at']
+  }
+
+  Note: 'Exit Validation Service owner. Status machine: VALID → USED | EXPIRED | DENIED. DENIED triggers exit.denied Kafka event which feeds shrinkage_signals in ClickHouse.'
+}
+
+
+Table override_log {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  exit_token_id   uuid          [not null, ref: > exit_tokens.id]
+  staff_id        uuid          [not null, ref: > users.id, note: 'Staff member who authorised the override']
+  reason_code     varchar(50)   [not null, note: 'SYSTEM_ERROR | RFID_MISMATCH | MANAGER_OVERRIDE | PAYMENT_PENDING']
+  override_at     timestamptz   [not null, default: `now()`]
+
+  indexes {
+    exit_token_id  [name: 'idx_override_log_exit_token_id']
+    staff_id       [name: 'idx_override_log_staff_id']
+    override_at    [name: 'idx_override_log_override_at']
+  }
+
+  Note: 'Exit Validation Service owner. Append-only. Required for shrinkage investigation. Every gate override must be logged with a reason code.'
+}
+
+
+// =============================================================================

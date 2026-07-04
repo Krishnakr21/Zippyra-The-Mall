@@ -1,0 +1,195 @@
+{
+  "ilm_policies": {
+    "_comment": "Index Lifecycle Management policies for all Zippyra ES indices",
+
+    "products_ilm": {
+      "policy": {
+        "phases": {
+          "hot": {
+            "min_age": "0ms",
+            "actions": {
+              "rollover": {
+                "_comment": "products index does not roll over — it is a single permanent index with routing",
+                "_disabled": true
+              },
+              "set_priority": { "priority": 100 }
+            }
+          },
+          "warm": {
+            "_comment": "products index does not move to warm — always needs fast access",
+            "_disabled": true
+          }
+        }
+      }
+    },
+
+    "orders_search_ilm": {
+      "_comment": "Order search index ages out old orders to save space. Recent 90 days stay hot.",
+      "policy": {
+        "phases": {
+          "hot": {
+            "min_age": "0ms",
+            "actions": {
+              "set_priority": { "priority": 50 },
+              "rollover": {
+                "max_age": "30d",
+                "max_size": "50gb"
+              }
+            }
+          },
+          "warm": {
+            "min_age": "90d",
+            "actions": {
+              "set_priority": { "priority": 25 },
+              "readonly": {},
+              "shrink": { "number_of_shards": 2 },
+              "forcemerge": { "max_num_segments": 1 }
+            }
+          },
+          "delete": {
+            "min_age": "365d",
+            "actions": {
+              "delete": {}
+            }
+          }
+        }
+      }
+    },
+
+    "support_tickets_ilm": {
+      "_comment": "Tickets older than 2 years move to warm storage, deleted after 5 years",
+      "policy": {
+        "phases": {
+          "hot": {
+            "min_age": "0ms",
+            "actions": {
+              "set_priority": { "priority": 30 }
+            }
+          },
+          "warm": {
+            "min_age": "730d",
+            "actions": {
+              "readonly": {},
+              "forcemerge": { "max_num_segments": 1 }
+            }
+          },
+          "delete": {
+            "min_age": "1825d",
+            "actions": { "delete": {} }
+          }
+        }
+      }
+    },
+
+    "users_search_ilm": {
+      "_comment": "User index never deletes (user records are retained). Just force-merges periodically.",
+      "policy": {
+        "phases": {
+          "hot": {
+            "min_age": "0ms",
+            "actions": {
+              "set_priority": { "priority": 50 }
+            }
+          },
+          "warm": {
+            "_comment": "Move inactive user shards to warm after 1 year with no index writes",
+            "min_age": "365d",
+            "actions": {
+              "forcemerge": { "max_num_segments": 1 }
+            }
+          }
+        }
+      }
+    }
+  },
+
+  "cluster_config": {
+    "primary_cluster": {
+      "name": "zippyra-es-prod",
+      "type": "Amazon OpenSearch Service",
+      "version": "OpenSearch 2.11",
+      "_comment": "AWS recommends OpenSearch (ES fork) for managed deployments. API-compatible with ES 7.10.",
+      "indices": ["products", "stores", "orders_search", "support_tickets"],
+      "nodes": {
+        "master": { "count": 3, "instance": "m6g.large.search", "_comment": "Dedicated master nodes — never use data nodes as master" },
+        "data_hot": { "count": 12, "instance": "r6g.4xlarge.search", "storage": "1TB gp3 per node", "_comment": "products index is hot always — NVMe-backed gp3" },
+        "data_warm": { "count": 6, "instance": "r6g.2xlarge.search", "storage": "4TB st1 per node", "_comment": "Older orders_search and support_tickets shards" }
+      },
+      "availability_zones": 3,
+      "vpc_isolated": true,
+      "encryption_at_rest": true,
+      "node_to_node_encryption": true,
+      "fine_grained_access_control": true
+    },
+
+    "pii_cluster": {
+      "name": "zippyra-es-pii",
+      "type": "Amazon OpenSearch Service",
+      "version": "OpenSearch 2.11",
+      "indices": ["users_search"],
+      "_CRITICAL": "Separate VPC subnet from primary cluster. No VPC peering to primary cluster. Only Admin Service service account has access.",
+      "nodes": {
+        "master": { "count": 3, "instance": "m6g.large.search" },
+        "data_hot": { "count": 6, "instance": "r6g.2xlarge.search", "storage": "500GB gp3 per node" }
+      },
+      "availability_zones": 3,
+      "vpc_isolated": true,
+      "vpc_subnet": "private-pii-subnet (separate from main services subnet)",
+      "encryption_at_rest": { "enabled": true, "kms_key": "zippyra-pii-kms" },
+      "audit_logging": true,
+      "fine_grained_access_control": true,
+      "saml_auth": true
+    }
+  },
+
+  "indexing_pipeline": {
+    "products_indexing": {
+      "trigger": "Kafka consumer: catalog.product_updated → Catalog Service ES worker (es-indexing-cg)",
+      "steps": [
+        "1. Consume catalog.product_updated event",
+        "2. Fetch full product from PostgreSQL (for fields not in Kafka payload)",
+        "3. Fetch current effective_price from pricing_rules table",
+        "4. Fetch in_stock + stock_qty from Redis product_availability:{store_id}:{sku_id}",
+        "5. Compute popularity_score from ClickHouse product_velocity (cached 1hr)",
+        "6. Compute has_offer + offer_badge_text from Redis offer_rules:{store_id}",
+        "7. Index document with routing=store_id via products_write alias",
+        "8. Update store_catalog_version:{store_id} in Redis with new hash"
+      ],
+      "latency_target": "< 5s from Kafka event to searchable",
+      "bulk_batch_size": 500,
+      "bulk_flush_interval_ms": 1000
+    },
+    "bulk_import_indexing": {
+      "trigger": "catalog.bulk_import_complete Kafka event",
+      "approach": "Parallel bulk indexing with 10 worker goroutines per store",
+      "target": "50,000 SKUs indexed in < 60 seconds",
+      "steps": [
+        "1. On catalog.import_job event: start worker pool",
+        "2. Read products from PostgreSQL in batches of 500",
+        "3. Enrich each batch: pricing + stock + offers in parallel",
+        "4. Bulk index via products_write alias with routing=store_id",
+        "5. On completion: publish catalog.bulk_import_complete",
+        "6. Rotate store_catalog_version hash in Redis"
+      ]
+    },
+    "stock_sync": {
+      "trigger": "Scheduled job every 30 seconds",
+      "purpose": "Sync in_stock and stock_qty from Redis to ES to keep search results accurate",
+      "approach": "Partial update (update_by_query) on changed SKUs only — never full reindex",
+      "query": "Update products WHERE store_id=X AND sku_id IN (changed_skus_from_redis_scan)"
+    }
+  },
+
+  "monitoring": {
+    "critical_alerts": [
+      { "metric": "cluster_status == RED", "severity": "P0", "action": "Page SRE immediately. Search completely down." },
+      { "metric": "cluster_status == YELLOW", "severity": "P1", "action": "Some shard replicas missing. Investigate unassigned shards." },
+      { "metric": "search_p95_latency > 500ms", "severity": "P1", "action": "Search SLA breach. Check hot threads, GC pressure, shard sizes." },
+      { "metric": "indexing_latency > 30s (Kafka event to searchable)", "severity": "P2", "action": "Catalog updates not reaching search fast enough. Check es-indexing-cg lag." },
+      { "metric": "jvm_heap_used > 85%", "severity": "P1", "action": "GC pressure imminent. Scale data nodes or reduce shard count." },
+      { "metric": "disk_used > 80%", "severity": "P1", "action": "Trigger ILM warm tier migration. Scale storage." },
+      { "metric": "unassigned_shards > 0", "severity": "P1", "action": "Data node down or storage full. Investigate immediately." },
+      { "metric": "search_query_rate sudden drop > 50%", "severity": "P2", "action": "Possible cluster unavailability. Check API Gateway → ES connectivity." }
+    ]
+  }
+}

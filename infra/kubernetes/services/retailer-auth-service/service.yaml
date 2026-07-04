@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: retailer-auth-service
+  namespace: zippyra-prod
+spec:
+  selector:
+    app: retailer-auth-service
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080

@@ -1,0 +1,48 @@
+// Owner: Cart Service (analytics feed)
+// Retention: 1yr hot → S3 Standard archive
+// Chunk interval: 1 WEEK  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table cart_scan_events {
+  scanned_at         timestamptz   [not null, note: 'Hypertable time dimension (PK component). May be backfilled from WatermelonDB offline scan_buffer.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — store where scan occurred']
+  user_id            uuid          [not null, note: 'Customer who scanned — FK → users.id']
+  sku_id             uuid          [not null, note: 'Product scanned — FK → products.id']
+  session_id         uuid          [not null, note: 'Store session (store-scoped JWT session identifier)']
+  session_start_at   timestamptz   [null, note: 'Session start time — enables scan-to-purchase funnel duration in ClickHouse user_behavior_sessions']
+  scan_source        varchar(20)   [not null, note: 'CAMERA | OFFLINE_BUFFER | STAFF_KIOSK']
+  price_at_scan      numeric(10,2) [not null, note: 'Price served at scan time — detects price-change discrepancies']
+  offer_applied      uuid          [null, note: 'Offer ID applied at scan time — FK → offers.id']
+  added_to_cart      boolean       [not null, note: 'FALSE = scanned but duplicate — not added to cart']
+  device_id          text          [null, note: 'Device fingerprint for fraud analytics']
+  network_latency_ms integer       [null, note: 'API latency experienced by client at scan time (ms)']
+  synced_at          timestamptz   [null, note: 'Non-null = offline scan synced from WatermelonDB scan_buffer']
+  metadata           jsonb         [null, note: 'MLKit confidence score, barcode type (QR/EAN/UPC), scan attempt count']
+
+  indexes {
+    (scanned_at, id)              [pk, name: 'cart_scan_events_pkey']
+    (store_id, scanned_at)        [name: 'idx_cart_store_time']
+    (user_id, scanned_at)         [name: 'idx_cart_user_time']
+    (sku_id, scanned_at)          [name: 'idx_cart_sku_time']
+    (session_id, scanned_at)      [name: 'idx_cart_session']
+    (added_to_cart, scanned_at)   [name: 'idx_cart_conversion']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 WEEK
+  Space partition: store_id (4 partitions)
+  Compression    : after 6 months (segmentby: store_id,scan_source | orderby: scanned_at DESC)
+  Retention      : 12 months hot → S3 Standard
+  Writer         : Cart Service — Kafka consumer on cart.item_scanned topic (async write)
+  Consumers      : Analytics Service, Elasticsearch (trending_skus_{store_id} via cagg)
+
+  Continuous Aggregates:
+    cart_scans_hourly  — 1hr bucket — store_id,sku_id — COUNT(*), COUNT WHERE added_to_cart → trending SKUs
+    cart_scans_daily   — 1day bucket — store_id — COUNT(DISTINCT user_id), COUNT(*) → daily active shoppers
+    scan_funnel_daily  — 1day bucket — store_id,scan_source — COUNT(*), AVG(network_latency_ms)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 0 — payment_analytics_events

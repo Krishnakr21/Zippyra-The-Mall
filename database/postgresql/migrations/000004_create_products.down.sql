@@ -1,0 +1,2 @@
+-- 000004_create_products.down.sql
+DROP TABLE IF EXISTS products CASCADE;

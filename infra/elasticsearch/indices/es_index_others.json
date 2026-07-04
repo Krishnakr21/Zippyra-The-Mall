@@ -1,0 +1,226 @@
+{
+  "orders_search": {
+    "_meta": {
+      "index": "orders_search",
+      "description": "Order search index for admin panel and customer order history search. PostgreSQL is source of truth — this is a search projection only.",
+      "owner": "Order Service (writes) / Admin Service (reads)",
+      "shards": 16,
+      "replicas": 1,
+      "routing_field": "store_id",
+      "_warning": "PII fields (user_name, phone) are masked in this index. Full PII only in PostgreSQL."
+    },
+    "settings": {
+      "number_of_shards": 16,
+      "number_of_replicas": 1,
+      "refresh_interval": "10s"
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "order_id": { "type": "keyword" },
+        "store_id": { "type": "keyword" },
+        "chain_id": { "type": "keyword" },
+        "user_id": { "type": "keyword" },
+        "user_name_masked": {
+          "type": "keyword",
+          "_comment": "e.g. 'Raj***' — only first 3 chars + ***. Admin search by partial name."
+        },
+        "phone_masked": {
+          "type": "keyword",
+          "_comment": "e.g. '98765*****' — only first 5 digits. Admin search by partial phone."
+        },
+        "status": { "type": "keyword", "_comment": "CREATED | CONFIRMED | EXIT_PENDING | COMPLETED | REFUNDED" },
+        "payment_method": { "type": "keyword" },
+        "gateway": { "type": "keyword" },
+        "total_amount": { "type": "scaled_float", "scaling_factor": 100 },
+        "item_count": { "type": "short" },
+        "sku_names": {
+          "type": "text",
+          "analyzer": "standard",
+          "_comment": "Concatenated product names in order. Enables search: 'orders containing maggi'"
+        },
+        "sku_ids": { "type": "keyword" },
+        "has_refund": { "type": "boolean" },
+        "exit_gate_id": { "type": "keyword" },
+        "created_at": { "type": "date", "format": "strict_date_time" },
+        "completed_at": { "type": "date", "format": "strict_date_time" }
+      }
+    },
+    "aliases": {
+      "orders_search_read": {},
+      "orders_search_write": {}
+    },
+    "_query_examples": {
+      "admin_order_lookup": {
+        "_comment": "Admin panel: find orders by phone, order ID, SKU, date range",
+        "query": {
+          "bool": {
+            "must": [
+              { "multi_match": { "query": "<search>", "fields": ["order_id^5", "phone_masked^4", "user_name_masked^3", "sku_names^2"] } }
+            ],
+            "filter": [
+              { "term": { "store_id": "<store_id>" } },
+              { "range": { "created_at": { "gte": "now-30d" } } }
+            ]
+          }
+        }
+      }
+    }
+  },
+
+  "support_tickets": {
+    "_meta": {
+      "index": "support_tickets",
+      "description": "Support ticket search for admin and support agents. Full-text search across ticket subjects, messages, and resolution notes.",
+      "owner": "Support Service",
+      "shards": 8,
+      "replicas": 1,
+      "routing_field": "store_id"
+    },
+    "settings": {
+      "number_of_shards": 8,
+      "number_of_replicas": 1,
+      "refresh_interval": "30s",
+      "analysis": {
+        "analyzer": {
+          "ticket_analyzer": {
+            "type": "custom",
+            "tokenizer": "standard",
+            "filter": ["lowercase", "asciifolding", "stop"]
+          }
+        }
+      }
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "ticket_id": { "type": "keyword" },
+        "store_id": { "type": "keyword" },
+        "chain_id": { "type": "keyword" },
+        "user_id": { "type": "keyword" },
+        "order_id": { "type": "keyword" },
+        "category": { "type": "keyword", "_comment": "PAYMENT | REFUND | EXIT | PRODUCT | APP_BUG | OTHER" },
+        "status": { "type": "keyword", "_comment": "OPEN | PENDING | RESOLVED | CLOSED" },
+        "priority": { "type": "keyword", "_comment": "P1 | P2 | P3 | P4" },
+        "subject": {
+          "type": "text",
+          "analyzer": "ticket_analyzer",
+          "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+        },
+        "messages_text": {
+          "type": "text",
+          "analyzer": "ticket_analyzer",
+          "_comment": "Concatenated text of all ticket_messages. Updated on each new message. Enables full-thread search."
+        },
+        "assigned_agent_id": { "type": "keyword" },
+        "sla_breached": { "type": "boolean" },
+        "resolution_time_minutes": { "type": "integer" },
+        "created_at": { "type": "date", "format": "strict_date_time" },
+        "resolved_at": { "type": "date", "format": "strict_date_time" },
+        "sla_target_at": { "type": "date", "format": "strict_date_time" }
+      }
+    },
+    "aliases": {
+      "support_tickets_read": {},
+      "support_tickets_write": {}
+    },
+    "_query_examples": {
+      "agent_ticket_search": {
+        "query": {
+          "bool": {
+            "must": [
+              { "multi_match": { "query": "<search>", "fields": ["subject^3", "messages_text^2", "ticket_id^5", "order_id^4"] } }
+            ],
+            "filter": [
+              { "term": { "chain_id": "<jwt_chain_id>" } }
+            ]
+          }
+        },
+        "sort": [{ "sla_target_at": { "order": "asc" } }]
+      },
+      "sla_breach_report": {
+        "query": {
+          "bool": {
+            "filter": [
+              { "term": { "sla_breached": true } },
+              { "term": { "store_id": "<store_id>" } },
+              { "range": { "created_at": { "gte": "now-7d" } } }
+            ]
+          }
+        },
+        "aggs": {
+          "by_category": { "terms": { "field": "category" } },
+          "avg_resolution_time": { "avg": { "field": "resolution_time_minutes" } }
+        }
+      }
+    }
+  },
+
+  "users_search": {
+    "_meta": {
+      "index": "users_search",
+      "description": "PII-masked user search for admin panel. Deployed in a SEPARATE Elasticsearch cluster from all other indices. Access requires elevated IAM role.",
+      "owner": "Auth Service (writes) / Admin Service (reads with IAM elevation)",
+      "shards": 8,
+      "replicas": 1,
+      "cluster": "es-pii-cluster",
+      "_CRITICAL": "This index lives in a separate VPC-isolated cluster. Never co-locate with products/stores/orders indices.",
+      "pii_handling": "phone and email stored encrypted at rest (AES-256 KMS). Masked versions for search. Full PII only via Admin Service with audit log."
+    },
+    "settings": {
+      "number_of_shards": 8,
+      "number_of_replicas": 1,
+      "refresh_interval": "30s"
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "user_id": { "type": "keyword" },
+        "phone_masked": {
+          "type": "keyword",
+          "_comment": "First 5 digits + *****: '98765*****'. For partial phone lookup."
+        },
+        "phone_prefix": {
+          "type": "keyword",
+          "_comment": "First 3 digits of phone for regional analytics. NOT searchable by agents."
+        },
+        "name_first3": {
+          "type": "keyword",
+          "_comment": "First 3 characters of name. Used for name-based search without storing full name."
+        },
+        "name_tokens": {
+          "type": "text",
+          "analyzer": "standard",
+          "_comment": "Tokenized name for partial search. Individual tokens only, not full name reconstruction."
+        },
+        "email_domain": {
+          "type": "keyword",
+          "_comment": "Domain portion only: '@gmail.com'. Used for bulk lookup by email provider."
+        },
+        "city": { "type": "keyword" },
+        "state": { "type": "keyword" },
+        "is_active": { "type": "boolean" },
+        "is_deleted": { "type": "boolean" },
+        "account_created_at": { "type": "date", "format": "strict_date_time" },
+        "last_login_at": { "type": "date", "format": "strict_date_time" },
+        "total_orders": { "type": "integer" },
+        "total_spend": { "type": "scaled_float", "scaling_factor": 100 },
+        "loyalty_tier": { "type": "keyword" },
+        "segment": { "type": "keyword", "_comment": "NEW | OCCASIONAL | REGULAR | POWER | CHURNED" },
+        "device_type": { "type": "keyword" }
+      }
+    },
+    "aliases": {
+      "users_search_read": {
+        "_comment": "Only accessible via Admin Service with X-Elevated-Access: true header and admin.user_search IAM permission"
+      },
+      "users_search_write": {}
+    },
+    "_access_control": {
+      "read_requires": "IAM role: zippyra-admin-pii-read",
+      "write_requires": "IAM role: zippyra-admin-pii-write (Auth Service service account only)",
+      "every_access_logged": true,
+      "audit_topic": "admin.audit_event"
+    }
+  }
+}

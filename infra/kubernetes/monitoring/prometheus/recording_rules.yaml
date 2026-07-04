@@ -1,0 +1,30 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: zippyra-slo-rules
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: zippyra-slos
+      rules:
+        # 1. Payment Success Rate (SLO: 99.95%)
+        - record: zippyra:payment_success_rate:5m
+          expr: sum(rate(zippyra_payments_total{status="success"}[5m])) / sum(rate(zippyra_payments_total[5m]))
+        
+        # 2. Cart Scan Latency (SLO: P99 <= 100ms)
+        - record: zippyra:cart_scan_p99:5m
+          expr: histogram_quantile(0.99, sum(rate(zippyra_cart_duration_seconds_bucket[5m])) by (le))
+        
+        # 3. Barcode Scan Latency (SLO: P99 <= 50ms)
+        - record: zippyra:barcode_scan_p99:5m
+          expr: histogram_quantile(0.99, sum(rate(zippyra_scan_duration_seconds_bucket[5m])) by (le))
+        
+        # 4. Exit Validation Latency (SLO: P99 <= 500ms)
+        - record: zippyra:exit_validation_p99:5m
+          expr: histogram_quantile(0.99, sum(rate(zippyra_exit_duration_seconds_bucket[5m])) by (le))
+
+        # 5. Error Budget (30-day rolling)
+        - record: zippyra:slo_error_budget:30d
+          expr: 1 - (sum(increase(zippyra_payments_total{status="failed"}[30d])) / sum(increase(zippyra_payments_total[30d])))

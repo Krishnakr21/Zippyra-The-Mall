@@ -1,0 +1,6 @@
+syntax = "proto3";
+package zippyra.inventory.v1;
+option go_package = "github.com/zippyra/proto/inventory/v1";
+
+// Zippyra inventory service protobuf definitions.
+// Add RPC methods and message types here.

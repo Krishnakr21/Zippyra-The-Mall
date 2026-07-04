@@ -1,0 +1,306 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>server: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/zippyra/platform/services/store-service/cmd/server/main.go (92.9%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package main
+
+import (
+        "context"
+        "fmt"
+        "net/http"
+        "time"
+
+        "github.com/getsentry/sentry-go"
+        "github.com/go-chi/chi/v5"
+        chimw "github.com/go-chi/chi/v5/middleware"
+        "github.com/google/uuid"
+        "github.com/jackc/pgx/v5"
+        "github.com/jackc/pgx/v5/pgconn"
+        "github.com/jackc/pgx/v5/pgxpool"
+        "github.com/prometheus/client_golang/prometheus/promhttp"
+        goredis "github.com/redis/go-redis/v9"
+        "github.com/rs/zerolog/log"
+
+        "github.com/zippyra/platform/services/store-service/config"
+        "github.com/zippyra/platform/services/store-service/internal/handler"
+        "github.com/zippyra/platform/services/store-service/internal/kafka"
+        mw "github.com/zippyra/platform/services/store-service/internal/middleware"
+        "github.com/zippyra/platform/services/store-service/internal/model"
+        "github.com/zippyra/platform/services/store-service/internal/repository"
+        "github.com/zippyra/platform/services/store-service/internal/service"
+        "github.com/zippyra/platform/shared/health"
+        sharedhttp "github.com/zippyra/platform/shared/http"
+)
+
+type serverRunner interface {
+        Run(ctx context.Context) error
+}
+
+type dbPool interface {
+        Close()
+        Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+        Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+        QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// storeRepo is the interface needed by chainLookupAdapter
+type storeRepo interface {
+        GetByID(ctx context.Context, storeID uuid.UUID) (*model.Store, error)
+}
+
+// chainLookupAdapter adapts StoreRepository for the ChainScope middleware.
+type chainLookupAdapter struct {
+        repo storeRepo
+}
+
+func (a *chainLookupAdapter) GetStoreChainID(ctx context.Context, storeID uuid.UUID) (uuid.UUID, error) <span class="cov8" title="1">{
+        store, err := a.repo.GetByID(ctx, storeID)
+        if err != nil </span><span class="cov8" title="1">{
+                return uuid.Nil, err
+        }</span>
+        <span class="cov8" title="1">return store.ChainID, nil</span>
+}
+
+var (
+        loadConfig    = config.Load
+        initSentry    = sentry.Init
+        flushSentry   = sentry.Flush
+        pgPoolNew     = pgxpool.New
+        newPGPool     = func(ctx context.Context, connString string) (dbPool, error) <span class="cov0" title="0">{ return pgPoolNew(ctx, connString) }</span>
+        parseRedisURL = goredis.ParseURL
+        newRedis      = goredis.NewClient
+        newProducer   = kafka.NewProducer
+        serverNew     = sharedhttp.New
+        newServer     = func(cfg sharedhttp.ServerConfig) serverRunner <span class="cov0" title="0">{ return serverNew(cfg) }</span>
+        fatalLogger   = log.Fatal
+        mainFatal     = func(err error) <span class="cov0" title="0">{ fatalLogger().Err(err).Msg("fatal") }</span>
+)
+
+func main() <span class="cov8" title="1">{
+        if err := run(context.Background()); err != nil </span><span class="cov8" title="1">{
+                mainFatal(err)
+        }</span>
+}
+
+func run(ctx context.Context) error <span class="cov8" title="1">{
+        // 1. Load config
+        cfg := loadConfig()
+
+        if cfg.SentryDSN != "" </span><span class="cov8" title="1">{
+                if err := initSentry(sentry.ClientOptions{Dsn: cfg.SentryDSN, Environment: cfg.AppEnv}); err != nil </span><span class="cov0" title="0">{
+                        log.Error().Err(err).Msg("sentry init failed")
+                }</span>
+                <span class="cov8" title="1">defer flushSentry(2 * time.Second)</span>
+        }
+
+        // 2. Init DB pool
+        <span class="cov8" title="1">db, err := newPGPool(ctx, cfg.DatabaseURL)
+        if err != nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("db init failed: %w", err)
+        }</span>
+        <span class="cov8" title="1">defer db.Close()
+
+        // 3. Init Redis client
+        opts, err := parseRedisURL(cfg.RedisURL)
+        if err != nil </span><span class="cov8" title="1">{
+                return fmt.Errorf("redis url parse failed: %w", err)
+        }</span>
+        <span class="cov8" title="1">rdb := newRedis(opts)
+        defer rdb.Close()
+
+        // 4. Init Kafka producer
+        producer := newProducer(cfg.KafkaBrokers)
+        defer producer.Close()
+
+        // 5. Build chi router with full middleware chain
+        r := buildRouter(cfg, db, rdb, producer)
+
+        // 6. Run server — blocks until SIGTERM
+        srv := newServer(sharedhttp.ServerConfig{
+                Addr:        ":" + cfg.Port,
+                Handler:     r,
+                ServiceName: "store-service",
+        })
+        if err := srv.Run(ctx); err != nil &amp;&amp; err != http.ErrServerClosed </span><span class="cov8" title="1">{
+                return fmt.Errorf("server error: %w", err)
+        }</span>
+
+        <span class="cov8" title="1">return nil</span>
+}
+
+func buildRouter(cfg *config.Config, db dbPool, rdb *goredis.Client, producer *kafka.Producer) http.Handler <span class="cov8" title="1">{
+        r := chi.NewRouter()
+
+        // Global middleware chain
+        r.Use(chimw.Recoverer)
+        r.Use(chimw.RequestID)
+        r.Use(chimw.RealIP)
+        r.Use(chimw.Logger)
+        r.Use(chimw.Timeout(30 * time.Second))
+
+        // Health probes — no auth required
+        var healthDB *pgxpool.Pool
+        if p, ok := db.(*pgxpool.Pool); ok </span><span class="cov0" title="0">{
+                healthDB = p
+        }</span>
+        <span class="cov8" title="1">healthHandler := health.NewHealthHandler(health.HealthConfig{
+                DB:          healthDB,
+                Redis:       rdb,
+                KafkaBroker: cfg.KafkaBrokers[0],
+                ServiceName: "store-service",
+                Version:     cfg.Version,
+        })
+        r.Mount("/healthz", healthHandler)
+
+        // Init repositories
+        storeRepo := repository.NewStoreRepository(db)
+        qrRepo := repository.NewQRTokenRepository(db)
+        deviceRepo := repository.NewDeviceRepository(db)
+
+        // Init Redis Adapter for interfaces
+        redisAdapter := service.NewRedisAdapter(rdb)
+
+        // Init middleware
+        jwtMiddleware := mw.NewJWTMiddleware(cfg.JWTPublicKey, cfg.JWTPrivateKey, redisAdapter)
+        chainLookup := &amp;chainLookupAdapter{repo: storeRepo}
+        chainScopeMiddleware := mw.ChainScope(chainLookup)
+
+        // Init services
+        storeSvc := service.NewStoreService(storeRepo, qrRepo, redisAdapter, producer)
+        deviceSvc := service.NewDeviceService(deviceRepo, redisAdapter)
+
+        // Init handlers
+        storeHandler := handler.NewStoreHandler(storeSvc)
+        deviceHandler := handler.NewDeviceHandler(deviceSvc)
+
+        // Public
+        r.Get("/v1/store/nearby", storeHandler.Nearby)
+
+        // Customer routes
+        r.Group(func(r chi.Router) </span><span class="cov8" title="1">{
+                r.Use(jwtMiddleware.RequireCustomer())
+                r.Post("/v1/store/bind", storeHandler.Bind)
+                r.Post("/v1/store/{id}/exit", storeHandler.Exit)
+                r.Get("/v1/store/{id}/occupancy", storeHandler.Occupancy)
+        }</span>)
+
+        // Any authenticated user
+        <span class="cov8" title="1">r.Group(func(r chi.Router) </span><span class="cov8" title="1">{
+                r.Use(jwtMiddleware.RequireAuth())
+                r.Use(chainScopeMiddleware)
+                r.Get("/v1/store/{id}", storeHandler.GetStore)
+                r.Get("/v1/store/{id}/hours", storeHandler.Hours)
+        }</span>)
+
+        // Staff only
+        <span class="cov8" title="1">r.Group(func(r chi.Router) </span><span class="cov8" title="1">{
+                r.Use(jwtMiddleware.RequireStaff())
+                r.Use(chainScopeMiddleware)
+                r.Put("/v1/store/{id}/capacity", storeHandler.UpdateCapacity)
+                r.Get("/v1/store/{id}/devices", deviceHandler.ListDevices)
+        }</span>)
+
+        // Health &amp; Metrics
+        <span class="cov8" title="1">r.Handle("/metrics", promhttp.Handler())
+
+        return r</span>
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>

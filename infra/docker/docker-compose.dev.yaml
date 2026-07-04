@@ -1,0 +1,185 @@
+networks:
+  zippyra-local:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  clickhousedata:
+  timescaledata:
+
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: zippyra-postgres
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: zippyra
+      POSTGRES_USER: zippyra
+      POSTGRES_PASSWORD: zippyra_local
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - zippyra-local
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U zippyra" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: zippyra-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass zippyra_local --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    networks:
+      - zippyra-local
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "redis-cli -a zippyra_local ping | grep PONG" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: zippyra-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@localhost:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: "3"
+    networks:
+      - zippyra-local
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8-alpine
+    container_name: zippyra-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: zippyra_analytics
+      CLICKHOUSE_USER: zippyra
+      CLICKHOUSE_PASSWORD: zippyra_local
+    volumes:
+      - clickhousedata:/var/lib/clickhouse
+    networks:
+      - zippyra-local
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --spider http://localhost:8123/ping || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: zippyra-timescaledb
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_DB: zippyra_timeseries
+      POSTGRES_USER: zippyra
+      POSTGRES_PASSWORD: zippyra_local
+    volumes:
+      - timescaledata:/var/lib/postgresql/data
+    networks:
+      - zippyra-local
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U zippyra" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: zippyra-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - zippyra-local
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    container_name: zippyra-jaeger
+    ports:
+      - "16686:16686"
+      - "14250:14250"
+      - "6831:6831/udp"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    networks:
+      - zippyra-local
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider http://localhost:16686 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: zippyra-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - zippyra-local
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: zippyra-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: zippyra_local
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    networks:
+      - zippyra-local
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

@@ -1,0 +1,47 @@
+// Owner: Store Service
+// Retention: 1yr hot → S3 Standard archive
+// Chunk interval: 1 WEEK  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table store_traffic {
+  recorded_at        timestamptz   [not null, note: 'Hypertable time dimension (PK component). Written on every entry/exit event and periodic snapshots.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — FK → stores.id']
+  event_type         varchar(25)   [not null, note: 'ENTRY | EXIT | SNAPSHOT | CAPACITY_ALERT']
+  current_count      integer       [not null, note: 'Occupancy headcount at this exact moment']
+  max_capacity       integer       [not null, note: "Store's configured max_capacity at time of record"]
+  occupancy_pct      numeric(5,2)  [not null, note: 'current_count / max_capacity * 100 — computed on insert']
+  entry_delta        smallint      [not null, default: 0, note: '+1 for ENTRY | -1 for EXIT | 0 for SNAPSHOT/ALERT']
+  dwell_time_seconds integer       [null, note: 'Time between matched entry and exit for same user session (seconds). NULL for SNAPSHOT/ALERT events.']
+  queue_length       smallint      [not null, default: 0, note: 'Virtual queue depth at moment of CAPACITY_ALERT — 0 otherwise']
+  trigger_source     varchar(25)   [null, note: 'GATE_SENSOR | MANUAL | SCHEDULED_SNAPSHOT | BLE_ESTIMATE']
+  user_id            uuid          [null, note: 'Customer user_id — populated for ENTRY/EXIT events; NULL for aggregate SNAPSHOT']
+  session_id         uuid          [null, note: 'Store session ID — correlates with cart_scan_events.session_id for end-to-end funnel']
+  metadata           jsonb         [null, note: 'Gate ID, BLE beacon count, sensor ID, etc.']
+
+  indexes {
+    (recorded_at, id)             [pk, name: 'store_traffic_pkey']
+    (store_id, recorded_at)       [name: 'idx_traffic_store_time']
+    (event_type, recorded_at)     [name: 'idx_traffic_type_time']
+    (store_id, event_type, recorded_at) [name: 'idx_traffic_store_event']
+    (session_id, recorded_at)           [name: 'idx_traffic_session']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 WEEK
+  Space partition: store_id (4 partitions)
+  Compression    : after 6 months (segmentby: store_id,event_type | orderby: recorded_at DESC)
+  Retention      : 12 months hot → S3 Standard
+  Writer         : Store Service (direct write — periodic snapshot every 15min + entry/exit events)
+                   Also consumes Kafka topic store.session_started to record session-bound ENTRY events
+  Consumers      : Analytics Service, ClickHouse peak_hour_heatmap
+
+  Continuous Aggregates:
+    traffic_15min  — 15min bucket — store_id — AVG(current_count), MAX(occupancy_pct) → Redis store_capacity
+    traffic_hourly — 1hr bucket — store_id — AVG(occupancy_pct), SUM(entry_delta>0) → ClickHouse heatmap
+    traffic_daily  — 1day bucket — store_id — MAX(current_count), total_entries, AVG(dwell_time_seconds)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 3 — conveyor_rfid_events

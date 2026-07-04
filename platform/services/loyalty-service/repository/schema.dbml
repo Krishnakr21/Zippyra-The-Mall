@@ -1,0 +1,90 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 8 — LOYALTY SERVICE
+// Tables: loyalty_ledger, loyalty_tiers, loyalty_cards, loyalty_tier_history
+// =============================================================================
+
+Table loyalty_ledger {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  user_id         uuid          [not null, ref: > users.id]
+  order_id        uuid          [null, ref: > orders.id, note: 'Null for manual adjustments or expiry entries']
+  points_change   integer       [not null, note: 'Positive = earn; Negative = redeem or expiry']
+  type            varchar(30)   [not null, note: 'EARN | REDEEM | EXPIRE | BONUS | ADJUSTMENT']
+  balance_after   integer       [not null, note: 'Running balance after this entry; derived from SUM but stored for performance']
+  notes           text          [null, note: 'Human-readable reason — required for ADJUSTMENT type (e.g. "Goodwill correction for order ORD-123"), useful for BONUS. Shown on user loyalty statement.']
+  created_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id        [name: 'idx_loyalty_ledger_user_id']
+    order_id       [name: 'idx_loyalty_ledger_order_id']
+    created_at     [name: 'idx_loyalty_ledger_created_at']
+    (user_id, created_at) [name: 'idx_loyalty_ledger_user_created']
+  }
+
+  Note: 'Loyalty Service owner. Append-only — never UPDATE. True balance = SUM(points_change) per user_id. balance_after is a performance-optimised snapshot. notes required for ADJUSTMENT audit trail.'
+}
+
+
+// [GAP-B] loyalty_tiers — Referenced in Flow A-1 Profile
+// "PostgreSQL --- users, loyalty_tiers" — tier definition table was missing
+Table loyalty_tiers {
+  tier_name       varchar(50)   [pk, note: 'e.g. BRONZE | SILVER | GOLD | PLATINUM']
+  min_points      integer       [not null]
+  max_points      integer       [null, note: 'Null for highest tier — no upper limit']
+  benefits_json   jsonb         [not null, note: 'e.g. {"extra_discount_pct": 5, "free_delivery": true, "priority_support": false}']
+  updated_at      timestamptz   [not null, default: `now()`, note: 'Updated when tier thresholds or benefits change']
+
+  indexes {
+    min_points     [name: 'idx_loyalty_tiers_min_points']
+  }
+
+  Note: '[GAP-B FIX] Required for Flow A-1 Profile (tier badge and thresholds display). App shows tier badge, progress bar, and benefits from benefits_json.'
+}
+
+
+// [GAP-B] loyalty_cards — Referenced in Flow B-5 (Loyalty Barcode)
+// "PostgreSQL --- loyalty_cards; barcode generated server-side"
+Table loyalty_cards {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  user_id         uuid          [unique, not null, ref: > users.id, note: 'One card per user']
+  card_number     varchar(50)   [unique, not null, note: 'Human-readable card number e.g. ZPY-0012345']
+  barcode_data    varchar(500)  [not null, note: 'Base64 or URL for barcode image; generated server-side']
+  issued_at       timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id        [unique, name: 'uq_loyalty_cards_user_id']
+    card_number    [unique, name: 'uq_loyalty_cards_number']
+  }
+
+  Note: '[GAP-B FIX] Required for Flow B-5 Loyalty Barcode. Barcode generated server-side; used for in-store and partner integrations.'
+}
+
+
+// [GAP-B] loyalty_tier_history — No audit trail for tier upgrades/downgrades
+// Customer disputes cannot be resolved without history
+Table loyalty_tier_history {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  user_id           uuid          [not null, ref: > users.id]
+  old_tier          varchar(50)   [not null, ref: > loyalty_tiers.tier_name, note: 'Tier before change']
+  new_tier          varchar(50)   [not null, ref: > loyalty_tiers.tier_name, note: 'Tier after change']
+  changed_at        timestamptz   [not null, default: `now()`]
+  trigger_order_id  uuid          [null, ref: > orders.id, note: 'Order that triggered tier upgrade/downgrade; null for manual changes']
+
+  indexes {
+    user_id          [name: 'idx_loyalty_tier_history_user_id']
+    changed_at       [name: 'idx_loyalty_tier_history_changed_at']
+  }
+
+  Note: '[GAP-B FIX] Audit trail for tier upgrades/downgrades. Required for customer dispute resolution. Append-only.'
+}
+
+
+// =============================================================================

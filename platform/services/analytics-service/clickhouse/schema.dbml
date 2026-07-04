@@ -1,0 +1,734 @@
+// ============================================================
+// ZIPPYRA — ClickHouse OLAP Schema
+// Tool: dbdiagram.io  |  Version: 2.0 Final  |  March 2026
+// 9 CH tables: 6 Phase 0-2 + 3 Phase 3
+// 6 stub tables: users, stores, products, categories,
+//                fraud_signals (TimescaleDB)
+// 34 Refs — all logical (ClickHouse does not enforce FK constraints)
+// ─────────────────────────────────────────────────────────────
+// GDPR NOTE: account.deletion_requested Kafka event triggers PII
+// purge cascade across ALL services. ClickHouse tables that store
+// user_id MUST anonymise (NULL or hash) the following columns:
+//   user_purchase_patterns.user_id
+//   user_behavior_sessions.user_id, device_id
+//   ml_fraud_features.user_id, device_id
+// The Analytics Service consumes account.deletion_requested and
+// issues ALTER TABLE ... UPDATE user_id=NULL WHERE user_id=?
+// (ClickHouse mutations). Anonymised rows are retained for metrics.
+// ============================================================
+
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 0-1 — user_purchase_patterns
+// Engine : ReplacingMergeTree(updated_at)
+// Owner  : Analytics Service
+// Writers: Kafka consumers on order.completed + refund.completed
+//          + hourly ML batch job
+// TTL    : 24 months
+// GDPR   : Anonymise user_id on account.deletion_requested
+// ─────────────────────────────────────────────────────────────
+Table user_purchase_patterns {
+  // ── Primary dimensions ────────────────────────────────────
+  user_id                  uuid           [not null, note: 'Customer FK -> users.id. GDPR: anonymised (NULL) on account.deletion_requested.']
+  sku_id                   uuid           [not null, note: 'Product FK -> products.id']
+  store_id                 uuid           [not null, note: 'Store FK -> stores.id. User may shop at multiple stores.']
+  // ── Denormalised dimensions ───────────────────────────────
+  category_id              uuid           [null,     note: 'Denormalised from products.category_id — avoids JOIN at query time']
+  preferred_category_id    uuid           [null,     note: 'Top category by purchase_count for this user — denorm for fast home-screen personalisation (D-1)']
+  last_store_id            uuid           [null,     note: 'Most recent store shopped at — multi-store affinity signal; may differ from store_id partition key']
+  // ── Purchase metrics ──────────────────────────────────────
+  purchase_count           integer        [not null, note: 'Total purchases of this SKU by this user across all time']
+  last_purchased_at        timestamp      [not null, note: 'Most recent purchase timestamp — recency signal for ML ranking']
+  avg_price_paid           decimal(10,2)  [not null, note: 'Rolling average price paid — price sensitivity signal']
+  total_spent              decimal(12,2)  [not null, note: 'Lifetime spend on this SKU — customer LTV signal']
+  return_rate              float          [not null, note: 'refund_count / purchase_count — product trust signal; high return_rate suppresses recommendation score']
+  avg_inter_purchase_days  float          [null,     note: 'AVG days between consecutive purchases of same SKU — replenishment cadence. NULL if purchase_count < 2.']
+  // ── RFM scores ────────────────────────────────────────────
+  recency_score            float          [not null, note: 'R of RFM: exp(-lambda x days_since_last_purchase) — 0.0 to 1.0']
+  frequency_score          float          [not null, note: 'F of RFM: log(1 + purchase_count) / max_freq — normalised 0.0 to 1.0']
+  monetary_value_score     float          [not null, note: 'M of RFM: total_spent / max_spent — normalised 0.0 to 1.0. Completes the RFM triple.']
+  ml_rank_score            float          [not null, note: 'Composite ML recommendation ranking score — 0.0 to 1.0. Inputs: RFM scores + Elasticsearch trending_skus boost.']
+  // ── Operational ───────────────────────────────────────────
+  updated_at               timestamp      [not null, note: 'ReplacingMergeTree version key — latest row wins on merge']
+  inserted_at              timestamp      [not null, note: 'Row-level insert timestamp — backfill detection and late-event audit']
+
+  indexes {
+    (store_id, user_id, sku_id)          [pk,   name: 'upp_pkey']
+    (store_id, ml_rank_score)            [name: 'idx_upp_store_rank']
+    (user_id, last_purchased_at)         [name: 'idx_upp_user_recency']
+    (category_id, store_id)             [name: 'idx_upp_category']
+    (sku_id, store_id, ml_rank_score)    [name: 'idx_upp_sku_rank']
+    (preferred_category_id, store_id)    [name: 'idx_upp_pref_cat']
+  }
+
+  note: '''
+  ENGINE         : ReplacingMergeTree(updated_at)
+  PARTITION BY   : toYYYYMM(last_purchased_at)
+  ORDER BY       : (store_id, user_id, sku_id)
+  TTL            : last_purchased_at + INTERVAL 24 MONTH DELETE
+  Kafka Writers  : order.completed           -> purchase_count, last_purchased_at, avg_price_paid, total_spent, recency_score, frequency_score
+                   refund.completed          -> return_rate update (refund_count / purchase_count recompute)
+                   account.deletion_requested -> GDPR anonymise user_id = NULL
+  Batch Writer   : Analytics Service — hourly ML job recalculates monetary_value_score, ml_rank_score
+  Readers        : Analytics Service /v1/recommendations/home (D-1), /v1/offers/personal (D-2)
+  Cross-system   : Reads PostgreSQL loyalty_ledger for LTV context
+                   Reads Elasticsearch trending_skus_{store_id} for ml_rank_score popularity boost
+  Dedup key      : (store_id, user_id, sku_id) — updated_at determines latest version
+  Scale estimate : 15M users x 500 avg SKUs = 7.5B rows at full scale
+  GDPR           : account.deletion_requested -> UPDATE user_id=NULL WHERE user_id=? (ClickHouse mutation)
+  '''
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 0-1 — sales_summary
+// Engine : SummingMergeTree
+// Owner  : Analytics Service
+// Writers: Kafka consumers on order.completed, refund.completed,
+//          payment.initiated, payment.failed, payment.confirmed
+// TTL    : 36 months (revenue history for demand forecasting)
+// ─────────────────────────────────────────────────────────────
+Table sales_summary {
+  // ── Partition + ordering dimensions ───────────────────────
+  event_date               date           [not null, note: 'Partition key — date of transactions']
+  hour                     integer        [not null, note: 'Hour 0-23 — sub-day drill-down for dashboards']
+  store_id                 uuid           [not null, note: 'Store FK -> stores.id — primary grouping dimension']
+  sku_id                   uuid           [null,     note: 'NULL for store-level aggregate rows; non-null for SKU-level rows']
+  category_id              uuid           [null,     note: 'Denormalised category FK -> categories.id — NULL for store-level rows']
+  // ── Transaction metrics ───────────────────────────────────
+  transaction_count        integer        [not null, note: 'COUNT(DISTINCT order_id) — SummingMergeTree sums on merge']
+  total_revenue            decimal(14,2)  [not null, note: 'SUM(order total including GST) — gross revenue KPI']
+  net_revenue              decimal(14,2)  [not null, note: 'total_revenue - refund_amount — most-queried dashboard net KPI']
+  total_qty_sold           integer        [not null, note: 'SUM(order_items.qty) — units volume']
+  avg_basket_size          decimal(10,2)  [not null, note: 'total_revenue / transaction_count — recalculated at read via FINAL']
+  // ── Refund metrics ────────────────────────────────────────
+  refund_count             integer        [not null, note: 'COUNT of refund.completed events in same window']
+  refund_amount            decimal(12,2)  [not null, note: 'SUM of refund amounts credited back to customers']
+  // ── Payment method breakdown ──────────────────────────────
+  upi_count                integer        [not null, note: 'UPI payment count']
+  card_count               integer        [not null, note: 'Card payment count']
+  wallet_count             integer        [not null, note: 'Wallet payment count']
+  split_count              integer        [not null, note: 'Split payment count']
+  failed_payment_count     integer        [not null, note: 'COUNT of payment.failed events — gateway reliability KPI']
+  avg_payment_latency_ms   float          [not null, note: 'AVG ms from payment.initiated to payment.confirmed — gateway performance KPI']
+  // ── Discount and loyalty ──────────────────────────────────
+  loyalty_redeemed         decimal(10,2)  [not null, note: 'SUM loyalty points redeemed as INR equivalent']
+  loyalty_transaction_count integer       [not null, note: 'COUNT of orders where loyalty redemption was applied']
+  coupon_discount          decimal(10,2)  [not null, note: 'SUM total coupon discount applied']
+  coupon_transaction_count integer        [not null, note: 'COUNT of orders where a coupon was applied']
+  // ── Shopper composition ───────────────────────────────────
+  new_user_count           integer        [not null, note: 'COUNT first-time shoppers this window — acquisition KPI (derived from users.created_at)']
+  returning_user_count     integer        [not null, note: 'COUNT users who purchased at least once before — retention KPI']
+  // ── Product mix ───────────────────────────────────────────
+  weight_items_count       integer        [not null, note: 'COUNT of sold_by_weight items sold — weighing station utilisation metric']
+  // ── Operational ───────────────────────────────────────────
+  inserted_at              timestamp      [not null, note: 'Row insert timestamp — detects late-arriving Kafka events; backfill audit']
+
+  indexes {
+    (store_id, event_date, hour, sku_id)  [pk,   name: 'ss_pkey']
+    (event_date, store_id)                [name: 'idx_ss_date_store']
+    (store_id, event_date)                [name: 'idx_ss_store_date']
+    (sku_id, event_date, total_revenue)   [name: 'idx_ss_sku_revenue']
+    (store_id, failed_payment_count)      [name: 'idx_ss_failed_pay']
+  }
+
+  note: '''
+  ENGINE         : SummingMergeTree(transaction_count, total_revenue, net_revenue, total_qty_sold,
+                     refund_count, refund_amount, failed_payment_count, upi_count, card_count,
+                     wallet_count, split_count, loyalty_redeemed, loyalty_transaction_count,
+                     coupon_discount, coupon_transaction_count, new_user_count, returning_user_count,
+                     weight_items_count)
+  PARTITION BY   : toYYYYMM(event_date)
+  ORDER BY       : (store_id, event_date, hour, sku_id)
+  TTL            : event_date + INTERVAL 36 MONTH DELETE
+  Kafka Writers  : order.completed    -> transaction_count, total_revenue, net_revenue, total_qty_sold,
+                                         loyalty_transaction_count, coupon_transaction_count
+                   refund.completed   -> refund_count, refund_amount (net_revenue recomputed)
+                   payment.initiated  -> avg_payment_latency_ms start time
+                   payment.failed     -> failed_payment_count
+                   payment.confirmed  -> avg_payment_latency_ms end time, upi/card/wallet/split_count
+  Readers        : Analytics Service /v1/analytics/dashboard — revenue KPIs
+  Dual-grain     : Both store-level (sku_id=NULL) and SKU-level rows inserted per event
+  Downstream     : demand_forecasting_features reads 12mo history from this table for ML training
+  '''
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 1-2 — peak_hour_heatmap
+// Engine : AggregatingMergeTree
+// Owner  : Analytics Service
+// Writers: Kafka consumers on store.session_started, exit.validated,
+//          exit.denied + hourly TimescaleDB traffic_hourly cagg batch
+// TTL    : 24 months
+// ─────────────────────────────────────────────────────────────
+Table peak_hour_heatmap {
+  // ── Partition + ordering dimensions ───────────────────────
+  event_date               date        [not null, note: 'Partition key — date of observation']
+  hour_bucket              integer     [not null, note: 'Hour 0-23 — heatmap x-axis']
+  day_of_week              integer     [not null, note: 'ISO weekday 1=Mon to 7=Sun — weekly pattern detection']
+  week_number              integer     [not null, note: 'ISO week number 1-53 — enables YoY heatmap comparisons without full date joins']
+  store_id                 uuid        [not null, note: 'Store FK -> stores.id']
+  // ── Occupancy metrics ─────────────────────────────────────
+  avg_occupancy            float       [not null, note: 'AVG(current_count) across 15-min snapshots this hour — from TimescaleDB traffic_15min cagg']
+  max_occupancy            integer     [not null, note: 'MAX(current_count) — peak headcount this hour']
+  max_occupancy_pct        float       [not null, note: 'max_occupancy / stores.max_capacity x 100']
+  // ── Traffic flow ──────────────────────────────────────────
+  entry_count              integer     [not null, note: 'Total entries this hour — from store.session_started Kafka events']
+  exit_count               integer     [not null, note: 'Total exits this hour — from exit.validated Kafka events']
+  net_flow                 integer     [not null, note: 'entry_count - exit_count — instantaneous occupancy delta; key for real-time capacity planning']
+  avg_dwell_minutes        float       [null,     note: 'AVG dwell time for sessions fully within this hour. NULL if no complete sessions.']
+  // ── Revenue and conversion ────────────────────────────────
+  revenue_this_hour        decimal(12,2) [not null, note: 'Total revenue from orders completed this hour — links foot traffic to revenue for ROI analysis']
+  conversion_rate          float       [not null, note: 'transaction_count / entry_count — fraction of entrants who purchased; primary store effectiveness KPI']
+  // ── Alerts and capacity ───────────────────────────────────
+  capacity_alert_count     integer     [not null, note: 'CAPACITY_ALERT events fired this hour']
+  queue_length_max         integer     [not null, note: 'MAX virtual queue depth this hour — from Redis virtual_queue:{store_id}']
+  denied_exit_count        integer     [not null, note: 'COUNT of exit.denied events this hour — fraud pressure signal per time slot']
+  // ── Scheduling ────────────────────────────────────────────
+  staff_count              integer     [null,     note: 'Scheduled staff count this hour — target variable for scheduling optimisation. NULL until staff roster integrated (Phase 3).']
+  is_festival_day          integer     [not null, note: '0 or 1 — festival/public holiday flag set from holiday calendar. Critical for seasonality-aware scheduling.']
+  // ── Data lineage ──────────────────────────────────────────
+  source                   varchar(20) [not null, note: 'TIMESCALE_CAGG | KAFKA_STREAM — which pipeline wrote this row']
+  updated_at               timestamp   [not null, note: 'AggregatingMergeTree version key — latest hourly load wins']
+  inserted_at              timestamp   [not null, note: 'Row insert timestamp — pipeline audit']
+
+  indexes {
+    (store_id, event_date, hour_bucket)  [pk,   name: 'phh_pkey']
+    (store_id, day_of_week, hour_bucket) [name: 'idx_phh_pattern']
+    (event_date, store_id)               [name: 'idx_phh_date']
+    (store_id, revenue_this_hour)        [name: 'idx_phh_revenue']
+    (store_id, denied_exit_count)        [name: 'idx_phh_fraud_hour']
+    (is_festival_day, store_id)          [name: 'idx_phh_festival']
+  }
+
+  note: '''
+  ENGINE         : AggregatingMergeTree
+  PARTITION BY   : toYYYYMM(event_date)
+  ORDER BY       : (store_id, event_date, hour_bucket)
+  TTL            : event_date + INTERVAL 24 MONTH DELETE
+  Kafka Writers  : store.session_started -> entry_count
+                   exit.validated        -> exit_count, revenue_this_hour (joined with order total)
+                   exit.denied           -> denied_exit_count
+  Batch Writer   : Analytics Service — hourly load from TimescaleDB traffic_hourly cagg
+                   (avg_occupancy, max_occupancy, avg_dwell_minutes, queue_length_max)
+  Readers        : Analytics Service /v1/analytics/heatmap — staff scheduling dashboard
+  Key Query      : SELECT hour_bucket, day_of_week, AVG(avg_occupancy), AVG(conversion_rate)
+                   WHERE store_id=? GROUP BY hour_bucket, day_of_week
+  Cross-system   : TimescaleDB traffic_hourly cagg -> occupancy and dwell metrics
+                   Redis virtual_queue:{store_id} -> queue_length_max snapshot
+  '''
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 1-2 — shrinkage_signals
+// Engine : ReplacingMergeTree(updated_at)
+// Owner  : Analytics Service
+// Writers: Kafka consumer on exit.denied + daily TimescaleDB batch
+//          + nightly Analytics ML pipeline
+// TTL    : 36 months (fraud audit trail)
+// ─────────────────────────────────────────────────────────────
+Table shrinkage_signals {
+  // ── Partition + ordering dimensions ───────────────────────
+  event_date               date           [not null, note: 'Partition key — date of signal observation']
+  store_id                 uuid           [not null, note: 'Store FK -> stores.id']
+  sku_id                   uuid           [null,     note: 'SKU-level signal — NULL for store-level aggregate rows']
+  category_id              uuid           [null,     note: 'Category of highest-shrinkage SKU this day — loss prevention focus. FK -> categories.id.']
+  signal_type              varchar(30)    [not null, note: 'EXIT_DENIAL | RFID_MISMATCH | WEIGHT_ANOMALY | BARCODE_TAMPER | REPEAT_OFFENDER']
+  // ── Signal counts ─────────────────────────────────────────
+  event_count              integer        [not null, note: 'COUNT of this signal_type on this date']
+  mismatch_count           integer        [not null, note: 'RFID tag mismatches — from TimescaleDB rfid_daily_mismatch cagg']
+  weight_anomaly_count     integer        [not null, note: 'COUNT of WEIGHT_ANOMALY events — weighing station discrepancies at exit gate']
+  barcode_tamper_count     integer        [not null, note: 'COUNT of BARCODE_TAMPER events — price tag swap detection']
+  shrinkage_qty            integer        [not null, note: 'Estimated units unaccounted — from TimescaleDB inv_daily_shrinkage cagg']
+  estimated_value_loss     decimal(12,2)  [not null, note: 'shrinkage_qty x avg_price_paid — INR value at risk']
+  recovery_amount          decimal(12,2)  [not null, note: 'INR value recovered by staff intervention — success metric for fraud team. 0.0 if no recovery.']
+  // ── Rate metrics ──────────────────────────────────────────
+  exit_denial_rate         float          [not null, note: 'exit.denied / exit.validated for this store on this date']
+  rfid_mismatch_rate       float          [not null, note: 'UNMATCHED / total RFID scans — from TimescaleDB rfid_daily_mismatch cagg']
+  // ── ML risk scoring ───────────────────────────────────────
+  model_risk_score         float          [not null, note: 'ML model output 0.0-1.0 — composite risk across all signal types']
+  alert_triggered          integer        [not null, note: '1 if model_risk_score > threshold and push alert sent to store manager']
+  staff_review_required    integer        [not null, note: '1 if model_risk_score > 0.85 — auto-escalation to loss prevention team']
+  repeat_offender_flag     integer        [not null, note: '1 if same user triggered EXIT_DENIAL more than 2 times in past 30 days']
+  // ── Operational ───────────────────────────────────────────
+  updated_at               timestamp      [not null, note: 'ReplacingMergeTree version — daily batch re-score overwrites previous']
+  inserted_at              timestamp      [not null, note: 'Row insert timestamp — pipeline audit']
+
+  indexes {
+    (store_id, event_date, signal_type, sku_id) [pk,   name: 'shk_pkey']
+    (event_date, store_id)                      [name: 'idx_shk_date']
+    (model_risk_score, event_date)              [name: 'idx_shk_risk']
+    (signal_type, store_id)                     [name: 'idx_shk_type']
+    (category_id, event_date)                   [name: 'idx_shk_category']
+    (staff_review_required, event_date)         [name: 'idx_shk_escalation']
+    (repeat_offender_flag, store_id)            [name: 'idx_shk_offender']
+  }
+
+  note: '''
+  ENGINE         : ReplacingMergeTree(updated_at)
+  PARTITION BY   : toYYYYMM(event_date)
+  ORDER BY       : (store_id, event_date, signal_type, sku_id)
+  TTL            : event_date + INTERVAL 36 MONTH DELETE
+  Kafka Writer   : exit.denied -> event_count, exit_denial_rate, repeat_offender_flag
+  Batch Writers  : TimescaleDB rfid_daily_mismatch cagg -> mismatch_count, rfid_mismatch_rate
+                   TimescaleDB inv_daily_shrinkage cagg -> shrinkage_qty, estimated_value_loss
+                   Analytics ML pipeline nightly -> model_risk_score, alert_triggered, staff_review_required
+  Readers        : Analytics Service fraud model (Phase 2+), store manager alert dashboard
+  Cross-system   : Feeds TimescaleDB fraud_signals via ML pipeline for real-time gate alerts
+  '''
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 1-2 — co_purchase_matrix
+// Engine : ReplacingMergeTree(last_computed_at)
+// Owner  : Analytics Service
+// Writers: Daily 2AM batch (association rule mining on PostgreSQL
+//          order_items 90-day window)
+// TTL    : 7 days rolling (stale pairs auto-removed)
+// ─────────────────────────────────────────────────────────────
+Table co_purchase_matrix {
+  // ── Primary pair dimensions ───────────────────────────────
+  sku_id_a              uuid      [not null, note: 'First SKU — always LOWER UUID string value (canonical ordering prevents A-B + B-A duplicates)']
+  sku_id_b              uuid      [not null, note: 'Second SKU — always HIGHER UUID string value']
+  store_id              uuid      [not null, note: 'Store FK -> stores.id — co-purchase patterns are store-scoped']
+  // ── Association metrics ───────────────────────────────────
+  co_purchase_count     integer   [not null, note: 'Orders containing BOTH SKUs in window. Must be >= 5 to be included.']
+  confidence            float     [not null, note: 'P(B|A) — probability of buying B given A in cart. Threshold: > 0.15']
+  lift                  float     [not null, note: 'confidence / P(B) — > 1.0 = positive association. Threshold: > 1.2']
+  support               float     [not null, note: 'P(A and B) — fraction of all orders containing both SKUs']
+  total_revenue_pair    decimal(12,2) [not null, note: 'SUM revenue from orders containing both SKUs — business value of this pair for merchandising']
+  // ── Temporal signals ──────────────────────────────────────
+  avg_days_between      float     [null,     note: 'AVG days between purchasing A then B in separate sessions. NULL if < 5 qualifying pairs.']
+  same_session_rate     float     [not null, note: 'Fraction of co-purchases in SAME store session (vs separate visits) — stronger signal for C-5 in-session auto-add']
+  // ── Category context ──────────────────────────────────────
+  category_a            uuid      [null,     note: 'Denormalised category of sku_id_a — FK -> categories.id']
+  category_b            uuid      [null,     note: 'Denormalised category of sku_id_b']
+  cross_category        integer   [not null, note: '1 if category_a != category_b — cross-category discovery flag']
+  price_tier_match      integer   [not null, note: '1 if both SKUs in same price bracket — prevents suggesting expensive item alongside budget item']
+  // ── Merchandising controls ────────────────────────────────
+  is_recipe_pair        integer   [not null, note: '1 if both SKUs appear together in PostgreSQL recipe_ingredients — Flow 7.12 recipe-to-cart']
+  seasonal_flag         integer   [not null, note: '1 if association only valid in current season — prevents stale cross-seasonal suggestions']
+  suppressed            integer   [not null, note: '1 if pair manually suppressed by merchandising team — overrides ML suggestion regardless of lift/confidence']
+  // ── Config traceability ───────────────────────────────────
+  window_days           integer   [not null, note: 'Lookback window used for this batch (default 90; may vary for seasonal runs) — model config traceability']
+  last_computed_at      timestamp [not null, note: 'ReplacingMergeTree version — daily batch timestamp; stale rows auto-expire via TTL']
+
+  indexes {
+    (store_id, sku_id_a, sku_id_b)  [pk,   name: 'cpm_pkey']
+    (store_id, sku_id_a, lift)      [name: 'idx_cpm_lift']
+    (store_id, is_recipe_pair)      [name: 'idx_cpm_recipe']
+    (store_id, cross_category)      [name: 'idx_cpm_cross']
+    (store_id, suppressed)          [name: 'idx_cpm_suppressed']
+    (store_id, same_session_rate)   [name: 'idx_cpm_session_rate']
+  }
+
+  note: '''
+  ENGINE         : ReplacingMergeTree(last_computed_at)
+  PARTITION BY   : store_id  (no time partition — full daily recompute per store)
+  ORDER BY       : (store_id, sku_id_a, sku_id_b)
+  TTL            : last_computed_at + INTERVAL 7 DAY DELETE
+  Batch Writer   : Analytics Service — daily 2AM cron
+                   Source: PostgreSQL order_items + orders (window_days rolling window)
+                   Filter: lift > 1.2 AND confidence > 0.15 AND co_purchase_count >= 5
+                   Dedup:  canonical pair sku_id_a < sku_id_b (UUID string compare)
+  Readers        : Analytics Service /v1/recommendations/cart-add (C-5)
+                   Catalog Service recipe-to-cart (Flow 7.12)
+  '''
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 0-1 — user_behavior_sessions
+// Engine : MergeTree (immutable once exit_at is set)
+// Owner  : Analytics Service
+// Writers: Kafka stitcher across 6 topics
+// TTL    : 24 months
+// GDPR   : Anonymise user_id + device_id on account.deletion_requested
+// ─────────────────────────────────────────────────────────────
+Table user_behavior_sessions {
+  // ── Session identity ──────────────────────────────────────
+  session_id              uuid           [not null, note: 'Store session identifier — join key stitched from 6 Kafka topics']
+  user_id                 uuid           [not null, note: 'Customer FK -> users.id. GDPR: anonymised on account.deletion_requested.']
+  store_id                uuid           [not null, note: 'Store FK -> stores.id']
+  session_date            date           [not null, note: 'Partition key — date session started']
+  // ── Timestamps and duration ───────────────────────────────
+  entry_at                timestamp      [not null, note: 'store.session_started timestamp']
+  exit_at                 timestamp      [null,     note: 'exit.validated timestamp — NULL if session still open or abandoned']
+  dwell_seconds           integer        [null,     note: 'EPOCH(exit_at) - EPOCH(entry_at). NULL if no exit.']
+  session_abandoned       integer        [not null, note: '1 if entry_at recorded but no payment AND no exit within 4 hours — explicit abandonment flag']
+  // ── Scanning behaviour ────────────────────────────────────
+  scan_count              integer        [not null, note: 'Total barcode/RFID scans in session']
+  items_added             integer        [not null, note: 'Items successfully added to cart']
+  items_removed           integer        [not null, note: 'Items removed from cart before payment']
+  unique_skus             integer        [not null, note: 'COUNT(DISTINCT sku_id) in session — basket diversity metric']
+  weight_items_scanned    integer        [not null, note: 'COUNT of sold_by_weight items scanned — weighing station demand metric']
+  offline_scans           integer        [not null, note: 'COUNT of scans via OFFLINE_BUFFER — connectivity issue indicator']
+  avg_scan_latency_ms     float          [null,     note: 'AVG network_latency_ms across session — from TimescaleDB cart_scan_events. NULL if no latency recorded.']
+  // ── Payment and checkout ──────────────────────────────────
+  cart_value_final        decimal(10,2)  [null,     note: 'Final cart value at payment.confirmed — NULL if abandoned']
+  gst_amount              decimal(10,2)  [null,     note: 'Total GST charged — from cart GST breakdown (Flow 9.6). NULL if abandoned.']
+  payment_completed       integer        [not null, note: '1 if payment.confirmed received; 0 if abandoned']
+  payment_method          varchar(10)    [null,     note: 'UPI | CARD | WALLET | SPLIT — NULL if abandoned']
+  payment_attempt_count   integer        [not null, note: 'COUNT of payment.initiated events before payment.confirmed — retry count; > 1 signals gateway issue or distraction tactic']
+  // ── Discount and loyalty ──────────────────────────────────
+  coupon_applied          integer        [not null, note: '1 if a coupon was applied; 0 otherwise — impacts cart_to_payment_rate analysis']
+  loyalty_points_used     decimal(10,2)  [not null, note: 'Loyalty points redeemed as INR equivalent — from cart loyalty-redeem flow (C-2)']
+  offer_views             integer        [not null, note: 'COUNT of offer banners viewed during session — upper-funnel engagement metric']
+  // ── Funnel rates ──────────────────────────────────────────
+  scan_to_cart_rate       float          [not null, note: 'items_added / scan_count — scan conversion efficiency']
+  cart_to_payment_rate    float          [not null, note: '1 if payment_completed else 0 — session conversion; primary abandonment KPI']
+  // ── Discovery and exit ────────────────────────────────────
+  search_count            integer        [not null, note: 'COUNT of Elasticsearch search queries during session — high value = poor shelf navigation']
+  rfid_exit_used          integer        [not null, note: '1 if exit_method = RFID — Phase 2+ RFID gate adoption tracking']
+  entry_method            varchar(15)    [not null, note: 'QR_CODE | BLE_BEACON | MANUAL — from store.session_started']
+  exit_method             varchar(10)    [null,     note: 'QR | RFID | MANUAL — NULL if session not yet exited']
+  // ── Device and connectivity ───────────────────────────────
+  device_id               varchar(100)   [null,     note: 'Device fingerprint from auth.login_success — cross-links with ml_fraud_features.device_id. GDPR: anonymised on account.deletion_requested.']
+  app_version             varchar(20)    [null,     note: 'React Native app version at session start — tracks rollout impact on UX and conversion metrics']
+  network_type            varchar(10)    [null,     note: '4G | WIFI | 3G | OFFLINE — connectivity context for offline_scans interpretation']
+  // ── Operational ───────────────────────────────────────────
+  inserted_at             timestamp      [not null, note: 'Row insert timestamp — session stitching audit; detects late-arriving Kafka events']
+
+  indexes {
+    (store_id, session_date, user_id, session_id) [pk,   name: 'ubs_pkey']
+    (user_id, session_date)                       [name: 'idx_ubs_user']
+    (store_id, session_date)                      [name: 'idx_ubs_store']
+    (payment_completed, session_date)             [name: 'idx_ubs_payment']
+    (entry_method, session_date)                  [name: 'idx_ubs_entry']
+    (device_id, session_date)                     [name: 'idx_ubs_device']
+    (session_abandoned, session_date)             [name: 'idx_ubs_abandoned']
+    (app_version, session_date)                   [name: 'idx_ubs_appver']
+    (network_type, session_date)                  [name: 'idx_ubs_network']
+  }
+
+  note: '''
+  ENGINE         : MergeTree (sessions are immutable once exit_at is set)
+  PARTITION BY   : toYYYYMM(session_date)
+  ORDER BY       : (store_id, session_date, user_id, session_id)
+  TTL            : session_date + INTERVAL 24 MONTH DELETE
+  Kafka Writers  : auth.login_success         -> device_id, app_version
+                   store.session_started      -> entry_at, entry_method, network_type
+                   cart.item_scanned          -> scan_count, items_added, offline_scans, offer_views, search_count
+                   payment.initiated          -> payment_attempt_count (incremented per event)
+                   payment.confirmed          -> payment_completed, cart_value_final, gst_amount,
+                                                 payment_method, coupon_applied, loyalty_points_used
+                   exit.validated             -> exit_at, exit_method, dwell_seconds, rfid_exit_used
+                   account.deletion_requested -> GDPR: user_id=NULL, device_id=NULL
+  Write strategy : Session opened on store.session_started; columns populated as events arrive;
+                   session_abandoned flagged if no exit after 4h; closed on exit.validated
+  Readers        : Analytics Service /v1/analytics/funnel — scan-to-purchase conversion dashboard
+  Cross-system   : avg_scan_latency_ms sourced from TimescaleDB cart_scan_events
+  GDPR           : account.deletion_requested -> UPDATE user_id=NULL, device_id=NULL WHERE user_id=?
+  '''
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 3 — demand_forecasting_features
+// Engine : ReplacingMergeTree(computed_at)
+// Owner  : Analytics Service (ML pipeline)
+// Writers: Daily ML batch job
+// TTL    : 12 months
+// ─────────────────────────────────────────────────────────────
+Table demand_forecasting_features {
+  // ── Dimensions ────────────────────────────────────────────
+  forecast_date            date           [not null, note: 'The date this forecast is FOR (not when computed). Partition key.']
+  store_id                 uuid           [not null, note: 'Store FK -> stores.id']
+  sku_id                   uuid           [not null, note: 'Product FK -> products.id']
+  horizon_days             integer        [not null, note: 'Forecast horizon: 7 | 14 | 30 | 90 days ahead']
+  // ── Predictions ───────────────────────────────────────────
+  predicted_qty            float          [not null, note: 'ML-predicted demand quantity for this horizon']
+  predicted_revenue        decimal(12,2)  [not null, note: 'predicted_qty x current_avg_price — INR revenue forecast']
+  lower_bound_qty          float          [not null, note: 'Prediction interval lower bound (P10) — pessimistic restocking']
+  upper_bound_qty          float          [not null, note: 'Prediction interval upper bound (P90) — optimistic restocking']
+  // ── Historical baseline ───────────────────────────────────
+  historical_avg_qty       float          [not null, note: 'AVG daily sales from same period last year — baseline for seasonality detection']
+  seasonality_factor       float          [not null, note: 'predicted_qty / historical_avg_qty — > 1.0 = peak season']
+  category_trend_factor    float          [not null, note: 'Category demand trend ratio (this month vs last month) — improves SKU-level forecast accuracy']
+  // ── Inventory context ─────────────────────────────────────
+  current_stock_qty        integer        [not null, note: 'Snapshot of qty_available from TimescaleDB inventory_movements at computation time']
+  stockout_risk            float          [not null, note: 'P(stockout before next GRN) given current_stock_qty — 0.0 to 1.0']
+  reorder_recommended      integer        [not null, note: '1 if stockout_risk > 0.3 AND predicted_qty > current_stock_qty']
+  days_until_next_grn      float          [null,     note: 'Estimated days until next GRN delivery — critical denominator for stockout_risk. NULL if no scheduled GRN.']
+  last_grn_qty             integer        [null,     note: 'Quantity in most recent GRN delivery — supplier capacity signal. NULL if no GRN history.']
+  grn_lead_time_days       float          [null,     note: 'AVG supplier lead time in days — earliest reorder arrival date. NULL if no history.']
+  // ── Promotional context ───────────────────────────────────
+  promotion_active         integer        [not null, note: '1 if active offer/coupon exists for this SKU today in PostgreSQL offers — demand uplift context']
+  competitor_price_signal  integer        [not null, note: '1 if competitor has same SKU at lower price — demand elasticity context. 0 if no competitor data.']
+  // ── ML provenance ─────────────────────────────────────────
+  model_version            varchar(30)    [not null, note: 'ML model version tag e.g. forecast-v1.2.0']
+  computed_at              timestamp      [not null, note: 'ReplacingMergeTree version — daily model run timestamp']
+  inserted_at              timestamp      [not null, note: 'Row insert timestamp — model run audit trail']
+
+  indexes {
+    (store_id, sku_id, forecast_date, horizon_days) [pk,   name: 'dff_pkey']
+    (store_id, forecast_date, reorder_recommended)  [name: 'idx_dff_reorder']
+    (sku_id, forecast_date)                         [name: 'idx_dff_sku']
+    (stockout_risk, forecast_date)                  [name: 'idx_dff_risk']
+    (horizon_days, store_id, forecast_date)         [name: 'idx_dff_horizon']
+    (store_id, category_trend_factor)               [name: 'idx_dff_trend']
+  }
+
+  note: '''
+  ENGINE         : ReplacingMergeTree(computed_at)
+  PARTITION BY   : toYYYYMM(forecast_date)
+  ORDER BY       : (store_id, sku_id, forecast_date, horizon_days)
+  TTL            : forecast_date + INTERVAL 12 MONTH DELETE
+  Phase          : 3 (Months 13-18) — Demand forecasting feature
+  Batch Writer   : Analytics Service — daily ML pipeline
+                   Inputs: ClickHouse sales_summary (12mo history)
+                           TimescaleDB inventory_movements (current_stock_qty via qty_after)
+                           PostgreSQL offers (promotion_active flag)
+                           Warehouse Service GRN data (days_until_next_grn, last_grn_qty, grn_lead_time_days)
+                           Kafka inventory.low_stock events (stockout trigger context)
+  Readers        : Warehouse Service — GRN planning and reorder recommendations
+                   Analytics Service /v1/analytics/forecast
+  Cross-system   : TimescaleDB inventory_movements.qty_after -> current_stock_qty snapshot
+  '''
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 3 — dynamic_pricing_signals
+// Engine : ReplacingMergeTree(computed_at_version)
+// Owner  : Analytics Service (ML pipeline)
+// Writers: Hourly ML batch job
+// TTL    : 6 months
+// ─────────────────────────────────────────────────────────────
+Table dynamic_pricing_signals {
+  // ── Dimensions ────────────────────────────────────────────
+  computed_at              timestamp      [not null, note: 'When signal was computed — partition dimension']
+  store_id                 uuid           [not null, note: 'Store FK -> stores.id — pricing is store-scoped']
+  sku_id                   uuid           [not null, note: 'Product FK -> products.id']
+  // ── Price comparison ──────────────────────────────────────
+  current_price            decimal(10,2)  [not null, note: 'Price from PostgreSQL products at computation time']
+  suggested_price          decimal(10,2)  [not null, note: 'ML-suggested optimal price']
+  price_delta_pct          float          [not null, note: '(suggested - current) / current x 100 — signed percentage change']
+  category_avg_price       decimal(10,2)  [not null, note: 'AVG price of comparable SKUs in same category — positional pricing reference']
+  // ── Demand signals ────────────────────────────────────────
+  demand_elasticity        float          [not null, note: 'Estimated price elasticity of demand — negative for normal goods']
+  current_stock_qty        integer        [not null, note: 'Inventory snapshot at computation time — high stock drives lower price']
+  current_stock_level_pct  float          [not null, note: 'current_stock_qty / max_stock_qty x 100 — normalised input for pricing model']
+  days_to_expiry           integer        [null,     note: 'Days until expiry for perishables — required for EXPIRY_PRESSURE reason. NULL for non-perishables.']
+  competitor_price         decimal(10,2)  [null,     note: 'Scraped competitor price — NULL if unavailable']
+  // ── Recommendation metadata ───────────────────────────────
+  price_direction          varchar(10)    [not null, note: 'INCREASE | DECREASE | HOLD']
+  reason                   varchar(30)    [not null, note: 'HIGH_STOCK | LOW_DEMAND | PEAK_HOUR | COMPETITOR_UNDERCUT | EXPIRY_PRESSURE']
+  confidence               float          [not null, note: 'Model confidence 0.0-1.0']
+  revenue_impact_est       decimal(12,2)  [not null, note: 'Estimated INR revenue delta if suggestion applied — manager ROI evaluation metric']
+  promotion_conflict       integer        [not null, note: '1 if suggested price conflicts with active offer in PostgreSQL offers — prevents undercutting']
+  price_change_history     varchar(500)   [null,     note: 'JSON: last 3 applied price changes [{price, applied_at, direction}] — price fatigue context']
+  // ── Approval workflow ─────────────────────────────────────
+  approved                 integer        [not null, note: '0=pending | 1=approved | 2=rejected — store manager review status']
+  applied_at               timestamp      [null,     note: 'When price change applied to PostgreSQL pricing_rules — NULL if not yet applied']
+  store_manager_id         uuid           [null,     note: 'Staff user_id who approved or rejected — FK -> users.id. NULL if pending.']
+  rejection_reason         varchar(200)   [null,     note: 'Free-text reason entered by store manager on rejection — audit trail']
+  // ── ML provenance ─────────────────────────────────────────
+  model_version            varchar(30)    [not null, note: 'ML model version tag e.g. pricing-v2.0.1']
+  computed_at_version      timestamp      [not null, note: 'ReplacingMergeTree version key — alias of computed_at']
+
+  indexes {
+    (store_id, sku_id, computed_at)       [pk,   name: 'dps_pkey']
+    (store_id, price_direction)           [name: 'idx_dps_direction']
+    (approved, computed_at)              [name: 'idx_dps_pending']
+    (confidence, computed_at)            [name: 'idx_dps_confidence']
+    (reason, store_id, computed_at)      [name: 'idx_dps_reason']
+    (promotion_conflict, computed_at)    [name: 'idx_dps_promo_conflict']
+    (store_manager_id, computed_at)      [name: 'idx_dps_manager']
+  }
+
+  note: '''
+  ENGINE         : ReplacingMergeTree(computed_at_version)
+  PARTITION BY   : toYYYYMM(toDate(computed_at))
+  ORDER BY       : (store_id, sku_id, toDate(computed_at))
+  TTL            : toDate(computed_at) + INTERVAL 6 MONTH DELETE
+  Phase          : 3 (Months 13-18) — Dynamic pricing feature
+  Batch Writer   : Analytics Service — hourly ML pipeline
+                   Inputs: ClickHouse user_purchase_patterns (demand elasticity)
+                           ClickHouse sales_summary (revenue trend)
+                           ClickHouse demand_forecasting_features (stock context)
+                           PostgreSQL offers (promotion_conflict check)
+  Readers        : Analytics Service /v1/analytics/pricing — store manager dashboard
+  Workflow       : ML suggests -> store manager reviews (approved: 0 -> 1 or 2)
+                   -> if approved: Catalog Service updates PostgreSQL pricing_rules -> applied_at set
+  '''
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 3 — ml_fraud_features
+// Engine : MergeTree (immutable — no updates ever)
+// Owner  : Analytics Service (ML pipeline)
+// Writers: Real-time at each exit gate fraud scoring event
+// TTL    : 36 months (ML training data + regulatory audit)
+// GDPR   : Anonymise user_id + device_id on account.deletion_requested
+// ─────────────────────────────────────────────────────────────
+Table ml_fraud_features {
+  // ── Dimensions ────────────────────────────────────────────
+  computed_at              timestamp   [not null, note: 'When this feature snapshot was computed. Partition dimension.']
+  user_id                  uuid        [not null, note: 'Customer FK -> users.id. GDPR: anonymised on account.deletion_requested.']
+  store_id                 uuid        [not null, note: 'Store FK -> stores.id — scoring context']
+  session_id               uuid        [not null, note: 'Store session at scoring time — links to user_behavior_sessions']
+  // ── Behavioural features ──────────────────────────────────
+  exit_denial_rate_7d      float       [not null, note: 'Fraction of exits denied for this user in last 7 days']
+  rfid_mismatch_rate_7d    float       [not null, note: 'RFID tag mismatch rate for this user in last 7 days']
+  scan_speed_anomaly       float       [not null, note: 'Z-score of scan speed vs user historical — high = suspicious rapid scanning']
+  price_tamper_flag        integer     [not null, note: '1 if cart price at scan != product price at exit checkout']
+  repeat_offender_score    float       [not null, note: 'Composite score from shrinkage_signals history — decays exponentially over 90 days']
+  basket_size_zscore       float       [not null, note: 'Z-score of basket size vs user historical — outlier detection']
+  high_value_items_count   integer     [not null, note: 'COUNT of items > 500 INR in cart — high-value theft risk signal']
+  offline_scan_fraction    float       [not null, note: 'Fraction of scans via OFFLINE_BUFFER — high fraction = connectivity anomaly or deliberate jamming']
+  cart_vs_exit_item_delta  integer     [not null, note: 'items_in_cart_at_payment - items_at_exit_gate — key shrinkage signal; > 0 = possible concealment']
+  time_in_store_zscore     float       [not null, note: 'Z-score of dwell_seconds vs user historical — unusually short = grab-and-go risk']
+  payment_attempts         integer     [not null, note: 'COUNT of payment.initiated before confirmed — distraction tactic correlation']
+  unusual_hour_flag        integer     [not null, note: '1 if session is outside this user normal shopping hours (from historical entry_at distribution)']
+  new_user_flag            integer     [not null, note: '1 if user account age < 30 days — new accounts statistically over-represented in retail fraud']
+  items_near_exit_flag     integer     [not null, note: '1 if last scanned item was within 2 aisle zones of exit gate — proximity-to-exit risk']
+  // ── Model output ──────────────────────────────────────────
+  model_score              float       [not null, note: 'Final fraud model output 0.0-1.0 — > 0.7 triggers alert at exit gate']
+  model_version            varchar(30) [not null, note: 'ML model version tag — links feature vector to model for retraining and rollback']
+  ml_explainability        varchar(500)[null,     note: 'JSON: top 3 features driving model_score [{feature, value, contribution}] — shown to staff with alert']
+  // ── Labelling and quality ─────────────────────────────────
+  signal_id                uuid        [null,     note: 'FK -> TimescaleDB fraud_signals.id — cross-system audit link (populated when alert triggered)']
+  device_id                varchar(100)[null,     note: 'Device fingerprint — cross-links with user_behavior_sessions.device_id. GDPR: anonymised on account.deletion_requested.']
+  label                    integer     [null,     note: 'Ground truth: 0=legit 1=fraud NULL=unlabelled (set by staff post-incident review)']
+  false_positive_flag      integer     [null,     note: '1 if label=0 (legit confirmed) but model_score > 0.7 — tracks model false positive rate']
+  inserted_at              timestamp   [not null, note: 'Row insert timestamp — ML audit trail; immutable']
+
+  indexes {
+    (store_id, computed_at, user_id, session_id) [pk,   name: 'mff_pkey']
+    (user_id, computed_at)                       [name: 'idx_mff_user']
+    (model_score, computed_at)                   [name: 'idx_mff_score']
+    (label, computed_at)                         [name: 'idx_mff_labelled']
+    (model_version, computed_at)                 [name: 'idx_mff_version']
+    (device_id, computed_at)                     [name: 'idx_mff_device']
+    (false_positive_flag, computed_at)           [name: 'idx_mff_false_pos']
+    (new_user_flag, model_score)                 [name: 'idx_mff_new_user']
+    (cart_vs_exit_item_delta, computed_at)       [name: 'idx_mff_delta']
+  }
+
+  note: '''
+  ENGINE         : MergeTree (immutable audit records — never updated)
+  PARTITION BY   : toYYYYMM(toDate(computed_at))
+  ORDER BY       : (store_id, toDate(computed_at), user_id, session_id)
+  TTL            : toDate(computed_at) + INTERVAL 36 MONTH DELETE
+  Phase          : 3 (Months 13-18) — AI fraud detection feature
+  Writer         : Analytics Service — ML pipeline at exit gate; written on every fraud scoring event
+  Readers        : Analytics Service — model retraining pipeline (WHERE label IS NOT NULL)
+                   Fraud audit dashboard — store manager review
+  Cross-system   : signal_id -> TimescaleDB fraud_signals.id (dual-system audit trail)
+                   device_id cross-links user_behavior_sessions.device_id + cart_scan_events.device_id
+                   cart_vs_exit_item_delta derived from TimescaleDB rfid_scan_events at exit gate
+  Retraining     : SELECT * FROM ml_fraud_features WHERE label IS NOT NULL AND model_version = ?
+  GDPR           : account.deletion_requested -> UPDATE user_id=NULL, device_id=NULL WHERE user_id=?
+                   Anonymised rows retained — label and model_score preserved for quality metrics
+  '''
+}
+
+
+// ============================================================
+// RELATIONSHIPS — logical FKs (application-layer enforced)
+// ClickHouse does not enforce FK constraints.
+// ============================================================
+
+// user_purchase_patterns
+Ref: user_purchase_patterns.user_id               > users.id
+Ref: user_purchase_patterns.sku_id                > products.id
+Ref: user_purchase_patterns.store_id              > stores.id
+Ref: user_purchase_patterns.category_id           > categories.id
+Ref: user_purchase_patterns.preferred_category_id > categories.id
+Ref: user_purchase_patterns.last_store_id         > stores.id
+
+// sales_summary
+Ref: sales_summary.store_id    > stores.id
+Ref: sales_summary.sku_id      > products.id
+Ref: sales_summary.category_id > categories.id
+
+// peak_hour_heatmap
+Ref: peak_hour_heatmap.store_id > stores.id
+
+// shrinkage_signals
+Ref: shrinkage_signals.store_id    > stores.id
+Ref: shrinkage_signals.sku_id      > products.id
+Ref: shrinkage_signals.category_id > categories.id
+
+// co_purchase_matrix
+Ref: co_purchase_matrix.store_id   > stores.id
+Ref: co_purchase_matrix.sku_id_a   > products.id
+Ref: co_purchase_matrix.sku_id_b   > products.id
+Ref: co_purchase_matrix.category_a > categories.id
+Ref: co_purchase_matrix.category_b > categories.id
+
+// user_behavior_sessions
+Ref: user_behavior_sessions.user_id  > users.id
+Ref: user_behavior_sessions.store_id > stores.id
+
+// demand_forecasting_features
+Ref: demand_forecasting_features.store_id > stores.id
+Ref: demand_forecasting_features.sku_id   > products.id
+
+// dynamic_pricing_signals
+Ref: dynamic_pricing_signals.store_id         > stores.id
+Ref: dynamic_pricing_signals.sku_id           > products.id
+Ref: dynamic_pricing_signals.store_manager_id > users.id
+
+// ml_fraud_features
+Ref: ml_fraud_features.user_id   > users.id
+Ref: ml_fraud_features.store_id  > stores.id
+Ref: ml_fraud_features.signal_id > fraud_signals.id
+
+
+// ============================================================
+// STUB TABLES — representative columns only
+// Full schemas live in the PostgreSQL and TimescaleDB deep-dives.
+// Included so dbdiagram.io renders all FK relationship arrows.
+// ============================================================
+
+Table users [note: 'Auth Service — PostgreSQL. GDPR: account_status=DELETED on purge.'] {
+  id             uuid        [pk]
+  phone          varchar(15) [not null]
+  created_at     timestamp   [not null, note: 'Account creation — used to compute new_user_count in sales_summary']
+  account_status varchar(20) [not null, note: 'ACTIVE | SUSPENDED | DELETED']
+}
+
+Table stores [note: 'Store Service — PostgreSQL'] {
+  id           uuid         [pk]
+  name         varchar(100) [not null]
+  max_capacity integer      [not null, note: 'Denominator for max_occupancy_pct in peak_hour_heatmap']
+  city         varchar(60)  [not null]
+  state        varchar(60)  [not null]
+  store_type   varchar(20)  [not null, note: 'SUPERMARKET | CONVENIENCE | HYPERMARKET']
+}
+
+Table products [note: 'Catalog Service — PostgreSQL'] {
+  id             uuid         [pk]
+  name           varchar(200) [not null]
+  barcode        varchar(30)  [not null, unique]
+  category_id    uuid         [not null]
+  sold_by_weight integer      [not null, note: '0 or 1 — drives weight_items_count in sales_summary']
+  base_price     decimal(10,2)[not null, note: 'MRP — reference for avg_price_paid comparison']
+}
+
+Table categories [note: 'Catalog Service — PostgreSQL'] {
+  id        uuid         [pk]
+  name      varchar(100) [not null]
+  parent_id uuid         [null, note: 'Self-ref FK — hierarchical: Dairy > Milk > Full Cream. NULL for top-level.']
+}
+
+Table fraud_signals [note: 'TimescaleDB hypertable — Exit Validation / Analytics Service. Referenced by ml_fraud_features.signal_id.'] {
+  id          uuid        [pk, note: 'Row identity — actual hypertable PK is (detected_at, id)']
+  detected_at timestamp   [not null]
+  store_id    uuid        [not null]
+  user_id     uuid        [null]
+  signal_type varchar(40) [not null]
+  severity    varchar(10) [not null, note: 'LOW | MEDIUM | HIGH | CRITICAL']
+  score       float       [not null]
+  actioned    integer     [not null, note: '1 if staff actioned this alert']
+}
+
+// Stub internal refs
+Ref: products.category_id > categories.id
+Ref: categories.parent_id > categories.id

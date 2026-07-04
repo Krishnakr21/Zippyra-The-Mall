@@ -1,0 +1,59 @@
+// Owner: Payment Service (analytics feed)
+// Retention: 5yr hot (compliance — RBI/SEBI)
+// Chunk interval: 1 MONTH  |  Space partition: gateway
+// NOTE: Renamed from payment_events to resolve naming conflict
+//       with PostgreSQL audit table payment_audit_log
+// ─────────────────────────────────────────────────────────────
+Table payment_analytics_events {
+  event_time         timestamptz   [not null, note: 'Hypertable time dimension (PK component). 5yr compliance retention.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  payment_id         uuid          [not null, note: 'FK → payments.id (PostgreSQL OLTP table)']
+  cart_id            uuid          [null, note: 'Cart being paid for — used for idempotency tracing and cart→payment funnel analytics']
+  order_id           uuid          [null, note: 'Populated after order.created event — FK → orders.id']
+  user_id            uuid          [not null, note: 'Customer — FK → users.id']
+  store_id           uuid          [not null, note: 'Store context — FK → stores.id']
+  gateway            varchar(20)   [not null, note: 'Space partition key — RAZORPAY | CASHFREE | PAYU']
+  payment_method     varchar(20)   [not null, note: 'UPI | CARD | WALLET | SPLIT']
+  event_type         varchar(30)   [not null, note: 'INITIATED | PENDING | CONFIRMED | FAILED | CANCELLED | WEBHOOK_RECEIVED | RETRY']
+  amount             numeric(12,2) [not null, note: 'Transaction amount in INR']
+  gateway_latency_ms integer       [null, note: 'Time from initiation to gateway ACK (ms)']
+  total_latency_ms   integer       [null, note: 'End-to-end from user tap to payment confirmation (ms)']
+  attempt_number     smallint      [not null, default: 1, note: 'Which retry attempt (1–3 max across gateways)']
+  error_code         text          [null, note: 'Gateway error code on FAILED events']
+  idempotency_key    text          [null, note: 'SHA-256(user_id+cart_id+timestamp_minute) — detect duplicate calls']
+  metadata           jsonb         [null, note: 'Gateway response payload, webhook signature hash, raw PSP response']
+
+  indexes {
+    (event_time, id)              [pk, name: 'payment_analytics_events_pkey']
+    (payment_id, event_time)      [name: 'idx_pay_payment_time']
+    (store_id, event_time)        [name: 'idx_pay_store_time']
+    (gateway, event_time)         [name: 'idx_pay_gateway_time']
+    (event_type, event_time)      [name: 'idx_pay_type_time']
+    (user_id, event_time)         [name: 'idx_pay_user_time']
+    (cart_id, event_time)         [name: 'idx_pay_cart_time']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 MONTH (compliance-grade; month-aligned for audit reports)
+  Space partition: gateway (3 partitions: RAZORPAY, CASHFREE, PAYU)
+  Compression    : after 13 months (segmentby: gateway,payment_method | orderby: event_time DESC)
+  Retention      : 60 months — NEVER auto-dropped (RBI/SEBI compliance)
+  Writer         : Payment Service — Kafka consumers on payment.initiated, payment.confirmed, payment.failed
+  Consumers      : Analytics Service, Reconciliation Service
+                   Cagg payment_gateway_5min → Redis gateway_health:{gw_name}
+
+  ⚠ NAMING CONFLICT RESOLVED:
+    This table was originally named payment_events in Section 4.3.
+    Renamed to payment_analytics_events to avoid collision with
+    PostgreSQL append-only audit table payment_audit_log.
+
+  Continuous Aggregates:
+    payment_gateway_5min   — 5min bucket — gateway — COUNT(*), AVG(latency), success_rate → Redis gateway_health
+    payment_daily_summary  — 1day bucket — store_id,gateway — COUNT(*), SUM(amount) → ClickHouse sales_summary
+    payment_hourly_method  — 1hr bucket — payment_method — COUNT(*), AVG(total_latency_ms)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 1 — store_traffic

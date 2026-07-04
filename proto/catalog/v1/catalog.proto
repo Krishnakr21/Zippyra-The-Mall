@@ -1,0 +1,6 @@
+syntax = "proto3";
+package zippyra.catalog.v1;
+option go_package = "github.com/zippyra/proto/catalog/v1";
+
+// Zippyra catalog service protobuf definitions.
+// Add RPC methods and message types here.

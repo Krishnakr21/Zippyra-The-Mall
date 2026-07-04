@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: exit-validation-service
+  namespace: zippyra-prod
+spec:
+  selector:
+    app: exit-validation-service
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080

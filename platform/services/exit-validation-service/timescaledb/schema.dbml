@@ -1,0 +1,87 @@
+// Owner: Exit Validation Service
+// Retention: 2yr hot → S3 Glacier archive
+// Chunk interval: 1 DAY  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table rfid_scan_events {
+  scanned_at         timestamptz   [not null, note: 'Hypertable time dimension (PK component). High burst: 50–200 tags/sec at peak.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — FK → stores.id']
+  gate_id            text          [not null, note: 'Physical gate identifier e.g. GATE_01']
+  rfid_tag_id        text          [not null, note: 'EPC tag code read by antenna']
+  order_id           uuid          [null, note: 'Matched order — NULL if tag not in any active order']
+  order_item_id      uuid          [null, note: 'Matched order_items.id row']
+  scan_result        varchar(20)   [not null, note: 'MATCHED | UNMATCHED | DUPLICATE | ALREADY_EXITED']
+  signal_strength    smallint      [null, note: 'RSSI dBm from antenna — filter ghost reads below threshold']
+  antenna_id         text          [null, note: 'Antenna within gate (gates may have multiple antennas)']
+  session_id         uuid          [null, note: 'Exit session — groups multiple tags into one gate pass']
+  user_id            uuid          [null, note: 'Customer exiting — FK → users.id. NULL if tag not matched to any user.']
+  conveyor_belt_id   text          [null, note: 'Phase 3: conveyor RFID belt identifier — NULL for gate scans']
+  metadata           jsonb         [null, note: 'Raw MQTT payload fields — vendor-specific data']
+
+  indexes {
+    (scanned_at, id)                        [pk, name: 'rfid_scan_events_pkey']
+    (store_id, gate_id, scanned_at)         [name: 'idx_rfid_store_gate']
+    (rfid_tag_id, scanned_at)               [name: 'idx_rfid_tag']
+    (order_id, scanned_at)                  [name: 'idx_rfid_order']
+    (scan_result, scanned_at)               [name: 'idx_rfid_result']
+    (user_id, scanned_at)                   [name: 'idx_rfid_user_time']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB
+  Chunk interval : 1 DAY (high-frequency MQTT ingest)
+  Space partition: store_id (4 partitions)
+  Compression    : after 7 days (segmentby: store_id,gate_id | orderby: scanned_at DESC)
+  Retention      : 24 months hot → S3 Glacier
+  Writer         : Exit Validation Service (direct write from MQTT handler)
+  Consumers      : Exit Validation (RFID reconcile against order_items), Analytics Service
+
+  Continuous Aggregates:
+    rfid_gate_hourly    — 1hr bucket — store_id,gate_id — COUNT(*), COUNT WHERE scan_result=UNMATCHED
+    rfid_daily_mismatch — 1day bucket — store_id — COUNT WHERE UNMATCHED → feeds ClickHouse shrinkage_signals
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 0 — cart_scan_events
+// Owner: Exit Validation Service
+// Retention: 2yr hot → S3 Glacier archive
+// Chunk interval: 1 DAY  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table conveyor_rfid_events {
+  scanned_at         timestamptz   [not null, note: 'Hypertable time dimension (PK component). Extremely high frequency: 500+ tags/sec at conveyor speed.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — FK → stores.id']
+  belt_id            text          [not null, note: 'Conveyor belt identifier e.g. BELT_01']
+  rfid_tag_id        text          [not null, note: 'EPC tag code read by antenna']
+  order_id           uuid          [null, note: 'Matched active order — NULL if tag unrecognised']
+  order_item_id      uuid          [null, note: 'Matched order_items.id row']
+  belt_speed_mps     numeric(4,2)  [null, note: 'Conveyor belt speed in metres per second at scan time']
+  scan_result        varchar(20)   [not null, note: 'MATCHED | UNMATCHED | GHOST_READ']
+  antenna_id         text          [null, note: 'Specific antenna on the belt that captured the tag']
+  session_id         uuid          [null, note: 'Exit session grouping all tags from one customer pass']
+  user_id            uuid          [null, note: 'Customer exiting — FK → users.id. NULL if tag unmatched.']
+  metadata           jsonb         [null, note: 'Raw MQTT payload — vendor-specific belt reader data']
+
+  indexes {
+    (scanned_at, id)              [pk, name: 'conveyor_rfid_events_pkey']
+    (store_id, belt_id, scanned_at) [name: 'idx_conv_store_belt']
+    (rfid_tag_id, scanned_at)     [name: 'idx_conv_tag']
+    (order_id, scanned_at)        [name: 'idx_conv_order']
+    (scan_result, scanned_at)     [name: 'idx_conv_result']
+    (user_id, scanned_at)         [name: 'idx_conv_user_time']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB (Phase 3 — Months 13–18)
+  Chunk interval : 1 DAY (even higher frequency than gate rfid_scan_events)
+  Space partition: store_id (4 partitions)
+  Compression    : after 7 days (segmentby: store_id,belt_id | orderby: scanned_at DESC)
+  Retention      : 24 months hot → S3 Glacier
+  Writer         : Exit Validation Service — MQTT handler for zippyra/exit/{store_id}/conveyor/scan
+  Consumers      : Analytics Service (fraud/shrinkage ML model)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 3 — fraud_signals

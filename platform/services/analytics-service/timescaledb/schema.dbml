@@ -1,0 +1,44 @@
+// Owner: Analytics Service (ML pipeline)
+// Retention: 3yr hot → S3 Standard archive
+// Chunk interval: 1 WEEK  |  Space partition: store_id
+// ─────────────────────────────────────────────────────────────
+Table fraud_signals {
+  detected_at        timestamptz   [not null, note: 'Hypertable time dimension (PK component). Written by ML pipeline when anomaly detected.']
+  id                 uuid          [not null, default: `gen_random_uuid()`, note: 'Row identity']
+  store_id           uuid          [not null, note: 'Space partition key — FK → stores.id']
+  user_id            uuid          [null, note: 'User-level signal: FK → users.id. NULL for store-level signals.']
+  signal_type        varchar(40)   [not null, note: 'EXIT_MISMATCH | UNUSUAL_SCAN_PATTERN | REPEAT_RFID_FAIL | PRICE_TAMPER | SCAN_SPEED_ANOMALY']
+  severity           varchar(10)   [not null, note: 'LOW | MEDIUM | HIGH | CRITICAL']
+  score              numeric(5,4)  [not null, note: 'ML model confidence score 0.0000–1.0000']
+  reference_id       uuid          [null, note: 'Triggering entity: order_id | exit_token_id | payment_id']
+  reference_type     varchar(20)   [null, note: 'ORDER | EXIT_TOKEN | PAYMENT — disambiguates reference_id']
+  feature_vector     jsonb         [not null, note: 'ML input features used to generate this signal — required for model retraining']
+  model_version      text          [not null, note: 'ML model version tag e.g. fraud-v2.1.3']
+  actioned           boolean       [not null, default: false, note: 'TRUE when staff reviewed or system auto-actioned']
+  actioned_at        timestamptz   [null, note: 'When actioned was set TRUE']
+  actioned_by        uuid          [null, note: 'Staff user_id who reviewed — NULL for auto-actioned']
+  metadata           jsonb         [null, note: 'Raw context, alert payload, supporting evidence']
+
+  indexes {
+    (detected_at, id)             [pk, name: 'fraud_signals_pkey']
+    (store_id, detected_at)       [name: 'idx_fraud_store_time']
+    (user_id, detected_at)        [name: 'idx_fraud_user_time']
+    (severity, detected_at)       [name: 'idx_fraud_severity']
+    (signal_type, detected_at)    [name: 'idx_fraud_type']
+    (actioned, detected_at)       [name: 'idx_fraud_unactioned']
+    (score, detected_at)          [name: 'idx_fraud_score']
+  }
+
+  note: '''
+  HYPERTABLE — TimescaleDB (Phase 3 — Months 13–18)
+  Chunk interval : 1 WEEK
+  Space partition: store_id (4 partitions)
+  Compression    : after 6 months (segmentby: store_id,signal_type | orderby: detected_at DESC)
+  Retention      : 36 months hot → S3 Standard (ML training data)
+  Writer         : Analytics Service (ML feature pipeline — direct write)
+  Consumers      : Analytics Service (fraud model inference), Support Service (CRITICAL alerts)
+  '''
+}
+
+// ─────────────────────────────────────────────────────────────
+// PHASE 3 — supply_chain_events

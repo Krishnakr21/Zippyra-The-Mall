@@ -1,0 +1,137 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 2 — STORE SERVICE
+// Tables: stores, store_hours, store_qr_tokens, beacon_verifications,
+//         aisle_layout, shelf_positions
+// =============================================================================
+
+Table stores {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  name            varchar(255)  [not null]
+  lat             decimal(10,7) [not null, note: 'Latitude; spatial index for geofencing']
+  lng             decimal(10,7) [not null, note: 'Longitude; spatial index for geofencing']
+  radius_m        integer       [not null, default: 100, note: 'Geofence radius in metres for BLE/GPS entry detection']
+  short_code      varchar(20)   [unique, not null, note: 'Human-readable store identifier e.g. BLR-001']
+  address         varchar(500)  [null, note: 'Full street address; used in store listing UI and support context']
+  city            varchar(100)  [null, note: 'City name e.g. Bengaluru']
+  state           varchar(100)  [null, note: 'State name e.g. Karnataka']
+  is_open         boolean       [not null, default: true]
+  ble_beacon_uuid uuid          [unique, null, note: 'BLE beacon UUID broadcasted in-store for proximity detection']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (lat, lng)         [name: 'idx_stores_lat_lng', note: 'Spatial index for geofence queries']
+    short_code         [unique, name: 'uq_stores_short_code']
+    ble_beacon_uuid    [unique, name: 'uq_stores_ble_beacon_uuid']
+    is_open            [name: 'idx_stores_is_open']
+  }
+
+  Note: 'Store Service owner. Each store is a separate session boundary. BLE beacon UUID must be unique across all stores.'
+}
+
+
+Table store_hours {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  store_id      uuid          [not null, ref: > stores.id]
+  day_of_week   smallint      [not null, note: '0=Sunday, 1=Monday ... 6=Saturday']
+  open_time     time          [not null]
+  close_time    time          [not null]
+  is_holiday    boolean       [not null, default: false, note: 'If true, store is closed this day regardless of times']
+  updated_at    timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (store_id, day_of_week) [unique, name: 'uq_store_hours_store_day']
+    store_id                [name: 'idx_store_hours_store_id']
+  }
+
+  Note: 'Used for Store Closed screen detection. App checks current time against store hours before allowing entry flow.'
+}
+
+
+// [GAP-A] store_qr_tokens — Referenced in Flow 5.5 (Store QR Scan)
+// Without this table, store QR binding has no persistence layer
+Table store_qr_tokens {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  token_hash    varchar(255)  [unique, not null, note: 'SHA-256 of the raw QR token']
+  store_id      uuid          [not null, ref: > stores.id]
+  issued_at     timestamptz   [not null, default: `now()`]
+  expires_at    timestamptz   [not null, note: 'Short TTL — typically 5 minutes for QR freshness']
+  is_used       boolean       [not null, default: false, note: 'Marks token as consumed to prevent replay attacks']
+
+  indexes {
+    token_hash   [unique, name: 'uq_store_qr_tokens_hash']
+    store_id     [name: 'idx_store_qr_tokens_store_id']
+    expires_at   [name: 'idx_store_qr_tokens_expires_at']
+  }
+
+  Note: '[GAP-A FIX] Required for Flow 5.5 Store QR Scan. QR codes are short-lived and single-use to prevent token replay.'
+}
+
+
+// [GAP-A] beacon_verifications — BLE session audit trail needed for dispute resolution
+Table beacon_verifications {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  user_id       uuid          [not null, ref: > users.id]
+  store_id      uuid          [not null, ref: > stores.id]
+  beacon_uuid   uuid          [not null, note: 'Matches stores.ble_beacon_uuid at time of detection']
+  detected_at   timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id      [name: 'idx_beacon_verifications_user_id']
+    store_id     [name: 'idx_beacon_verifications_store_id']
+    detected_at  [name: 'idx_beacon_verifications_detected_at']
+    (user_id, store_id, detected_at) [name: 'idx_beacon_verifications_composite']
+  }
+
+  Note: '[GAP-A FIX] BLE session audit trail. Required for dispute resolution when customer disputes in-store session or unauthorized charges.'
+}
+
+
+// [GAP-B] aisle_layout — Referenced in Flows 7.10, D-5 (AR Navigation)
+// Phase-2 build plan also lists: AR navigation → PostgreSQL (aisle_layout)
+Table aisle_layout {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  store_id      uuid          [not null, ref: > stores.id]
+  svg_data      text          [not null, note: 'SVG store map markup for in-app navigation rendering']
+  updated_at    timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id     [name: 'idx_aisle_layout_store_id']
+    updated_at   [name: 'idx_aisle_layout_updated_at']
+  }
+
+  Note: '[GAP-B FIX] Referenced in Flows 7.10 and D-5 AR Navigation. NOTE [GAP-C]: Flow D-5 uses name aisle_positions — standardised to aisle_layout per Phase 2 build plan line 1669.'
+}
+
+
+// [GAP-B] shelf_positions — Referenced in Flows 7.10, D-5, D-6 (AR Item Found)
+Table shelf_positions {
+  id            uuid          [pk, default: `gen_random_uuid()`]
+  store_id      uuid          [not null, ref: > stores.id, note: 'Denormalised for direct store-level queries without joining through aisle_layout']
+  sku_id        uuid          [not null, ref: > products.id, note: 'The product stocked at this shelf slot']
+  aisle_id      uuid          [not null, ref: > aisle_layout.id]
+  slot          varchar(50)   [not null, note: 'Human-readable slot identifier e.g. A3-S2']
+  coords_json   jsonb         [not null, note: '{"x": 120, "y": 340, "z": 1} — AR overlay coordinates']
+  updated_at    timestamptz   [not null, default: `now()`]
+
+  indexes {
+    store_id     [name: 'idx_shelf_positions_store_id']
+    sku_id       [name: 'idx_shelf_positions_sku_id']
+    aisle_id     [name: 'idx_shelf_positions_aisle_id']
+    (store_id, sku_id) [name: 'idx_shelf_positions_store_sku', note: 'AR item-found flow: given store + sku, find shelf coords']
+  }
+
+  Note: '[GAP-B FIX] Referenced in Flows 7.10, D-5, D-6. store_id denormalised for direct lookup. NOTE [GAP-C]: Flow D-5 uses name shelf_coords — standardised to shelf_positions per Phase 2 build plan line 1669.'
+}
+
+
+// =============================================================================

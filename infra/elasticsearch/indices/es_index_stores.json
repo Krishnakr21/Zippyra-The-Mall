@@ -1,0 +1,115 @@
+{
+  "_meta": {
+    "index": "stores",
+    "description": "Store directory index. Powers store search, geolocation-based discovery, and admin store lookup.",
+    "owner": "Store Service",
+    "shards": 4,
+    "replicas": 1,
+    "routing_field": "chain_id (optional)"
+  },
+  "settings": {
+    "number_of_shards": 4,
+    "number_of_replicas": 1,
+    "refresh_interval": "10s",
+    "analysis": {
+      "analyzer": {
+        "store_name_analyzer": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "store_id": { "type": "keyword" },
+      "chain_id": { "type": "keyword" },
+      "name": {
+        "type": "text",
+        "analyzer": "store_name_analyzer",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+      },
+      "short_code": { "type": "keyword" },
+      "city": { "type": "keyword" },
+      "state": { "type": "keyword" },
+      "pincode": { "type": "keyword" },
+      "address_line": { "type": "text", "analyzer": "store_name_analyzer" },
+      "location": {
+        "type": "geo_point",
+        "_comment": "lat/lng point. Enables distance-based store discovery. Replaces PostgreSQL GIST index for radius queries at scale."
+      },
+      "geofence": {
+        "type": "geo_shape",
+        "_comment": "Store geofence polygon from geofence_polygons table. Enables within-polygon entry detection."
+      },
+      "is_open": { "type": "boolean" },
+      "is_active": { "type": "boolean" },
+      "store_type": { "type": "keyword", "_comment": "SUPERMARKET | CONVENIENCE | HYPERMARKET | PHARMACY" },
+      "avg_rating": { "type": "float" },
+      "total_reviews": { "type": "integer" },
+      "capacity": { "type": "integer" },
+      "gstin": { "type": "keyword" },
+      "phone": { "type": "keyword", "index": false },
+      "image_url": { "type": "keyword", "index": false },
+      "open_time": { "type": "keyword" },
+      "close_time": { "type": "keyword" },
+      "ble_beacon_uuid": { "type": "keyword" },
+      "features": {
+        "type": "keyword",
+        "_comment": "['rfid_exit', 'self_checkout', 'home_delivery', 'kiosk', 'pharmacy']"
+      },
+      "updated_at": { "type": "date", "format": "strict_date_time" }
+    }
+  },
+  "aliases": {
+    "stores_read": {},
+    "stores_write": {}
+  },
+  "_query_examples": {
+    "nearby_stores": {
+      "_comment": "Find stores within 5km of user location",
+      "query": {
+        "bool": {
+          "filter": [
+            { "term": { "is_active": true } },
+            {
+              "geo_distance": {
+                "distance": "5km",
+                "location": { "lat": "<user_lat>", "lon": "<user_lng>" }
+              }
+            }
+          ]
+        }
+      },
+      "sort": [
+        {
+          "_geo_distance": {
+            "location": { "lat": "<user_lat>", "lon": "<user_lng>" },
+            "order": "asc",
+            "unit": "km"
+          }
+        }
+      ]
+    },
+    "admin_store_search": {
+      "_comment": "Admin panel: search stores by name, city, GSTIN, chain",
+      "query": {
+        "bool": {
+          "must": [
+            {
+              "multi_match": {
+                "query": "<search_term>",
+                "fields": ["name^3", "address_line^1", "city^2", "short_code^4", "gstin^5"]
+              }
+            }
+          ],
+          "filter": [
+            { "term": { "chain_id": "<jwt_chain_id>" } }
+          ]
+        }
+      }
+    }
+  }
+}

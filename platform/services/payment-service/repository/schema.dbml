@@ -1,0 +1,109 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 7 — PAYMENT SERVICE
+// Tables: payments, tokenized_cards, reconciliation_log, payment_audit_log
+// =============================================================================
+
+Table payments {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  order_id          uuid          [not null, ref: > orders.id]
+  gateway           varchar(50)   [not null, note: 'razorpay | paytm | upi | cashfree']
+  method            varchar(50)   [not null, note: 'UPI | CARD | NETBANKING | WALLET | CARD_TOKENIZED']
+  status            varchar(30)   [not null, note: 'INITIATED | PENDING | SUCCESS | FAILED | REFUNDED']
+  amount            decimal(12,2) [not null]
+  gateway_ref       varchar(255)  [null, note: 'Payment gateway transaction reference ID']
+  idempotency_key   varchar(255)  [unique, not null, note: 'UUID generated per payment attempt for dedup; prevents double charges']
+  retry_count       integer       [not null, default: 0, note: '[GAP-A FIX] Was missing in v1.0; max 3 retries across gateways']
+  created_at        timestamptz   [not null, default: `now()`]
+  updated_at        timestamptz   [not null, default: `now()`]
+
+  indexes {
+    order_id         [name: 'idx_payments_order_id']
+    status           [name: 'idx_payments_status']
+    gateway_ref      [name: 'idx_payments_gateway_ref']
+    idempotency_key  [unique, name: 'uq_payments_idempotency_key']
+    gateway          [name: 'idx_payments_gateway']
+  }
+
+  Note: 'Payment Service owner. retry_count added per Gap-A fix — was absent in v1.0 but payment retry logic requires retry_count++ (max 3 across gateways). idempotency_key prevents duplicate charges on network retry.'
+}
+
+
+// [GAP-B] tokenized_cards — Flow P-13 references tokenized card storage but no table existed
+Table tokenized_cards {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  user_id           uuid          [not null, ref: > users.id]
+  razorpay_token    varchar(255)  [not null, note: 'PCI-DSS: Razorpay vault token; Zippyra never stores raw card data']
+  card_last4        char(4)       [not null, note: 'Last 4 digits for display only e.g. ••••4242']
+  card_brand        varchar(20)   [not null, note: 'VISA | MASTERCARD | RUPAY | AMEX']
+  is_active         boolean       [not null, default: true, note: 'Soft delete for card removal UX. User taps Remove Card → is_active=false. Card is not hard-deleted in case historical payment records reference this tokenized flow.']
+  created_at        timestamptz   [not null, default: `now()`]
+
+  indexes {
+    user_id          [name: 'idx_tokenized_cards_user_id']
+    razorpay_token   [name: 'idx_tokenized_cards_token']
+    is_active        [name: 'idx_tokenized_cards_is_active']
+  }
+
+  Note: '[GAP-B FIX] Flow P-13 Card Payment. PCI-DSS compliant — only Razorpay vault token stored, never raw card numbers or CVV. is_active enables card removal without breaking historical payment audit trail.'
+}
+
+
+// [GAP-B] reconciliation_log — Service Registry names Reconciliation Service with this DB
+// Never schema-defined in original
+Table reconciliation_log {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  payment_id      uuid          [not null, ref: > payments.id]
+  gateway_ref     varchar(255)  [not null]
+  settled_amount  decimal(12,2) [not null]
+  status          varchar(30)   [not null, note: 'MATCHED | MISMATCH | PENDING | DISPUTE']
+  reconciled_at   timestamptz   [not null, default: `now()`]
+
+  indexes {
+    payment_id     [name: 'idx_reconciliation_log_payment_id']
+    status         [name: 'idx_reconciliation_log_status']
+    reconciled_at  [name: 'idx_reconciliation_log_reconciled_at']
+    gateway_ref    [name: 'idx_reconciliation_log_gateway_ref']
+  }
+
+  Note: '[GAP-B FIX] Reconciliation Service owner. Matches Zippyra payment records against payment gateway settlement reports. MISMATCH status triggers finance alert.'
+}
+
+
+// [GAP-C] payment_audit_log — Security section explicitly lists 4 append-only audit tables:
+// auth_events, payment_events (audit), override_log, admin_actions.
+// The "payment_events" PostgreSQL audit table is DISTINCT from payment_events in TimescaleDB
+// (analytics). Renamed here to payment_audit_log to resolve the [GAP-C] dual-role naming conflict.
+Table payment_audit_log {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  payment_id      uuid          [not null, ref: > payments.id]
+  order_id        uuid          [not null, ref: > orders.id]
+  user_id         uuid          [not null, ref: > users.id]
+  event_type      varchar(50)   [not null, note: 'PAYMENT_INITIATED | PAYMENT_SUCCESS | PAYMENT_FAILED | REFUND_INITIATED | REFUND_COMPLETED | CHARGEBACK']
+  amount          decimal(12,2) [not null]
+  gateway         varchar(50)   [not null, note: 'razorpay | paytm | upi | cashfree']
+  gateway_ref     varchar(255)  [null, note: 'Gateway transaction reference at time of event']
+  metadata        jsonb         [null, note: 'Additional context: error_code, retry_number, ip, device_id']
+  recorded_at     timestamptz   [not null, default: `now()`]
+
+  indexes {
+    payment_id     [name: 'idx_payment_audit_log_payment_id']
+    order_id       [name: 'idx_payment_audit_log_order_id']
+    user_id        [name: 'idx_payment_audit_log_user_id']
+    event_type     [name: 'idx_payment_audit_log_event_type']
+    recorded_at    [name: 'idx_payment_audit_log_recorded_at']
+  }
+
+  Note: '[GAP-C FIX] One of the 4 immutable audit tables in Security section. Append-only, never updated. Forever retention for compliance. RENAMED from payment_events to resolve dual-role conflict — payment_events in TimescaleDB is the analytics hypertable (latency, gateway health). This table is the compliance audit log.'
+}
+
+
+// =============================================================================

@@ -1,0 +1,6 @@
+syntax = "proto3";
+package zippyra.auth.v1;
+option go_package = "github.com/zippyra/proto/auth/v1";
+
+// Zippyra auth service protobuf definitions.
+// Add RPC methods and message types here.

@@ -1,0 +1,65 @@
+// =============================================================================
+// ZIPPYRA RETAIL INFRASTRUCTURE PLATFORM
+// PostgreSQL Schema — DBML for dbdiagram.io
+// Version: 4.0 Final | March 2026
+// Covers: All 46 documented tables + 33 Gap fixes from Section 10
+// Gap fixes are marked with: // [GAP-A], [GAP-B], [GAP-C]
+// =============================================================================
+
+
+// =============================================================================
+// GROUP 10 — WAREHOUSE SERVICE
+// Tables: warehouse_stock, transfers
+// =============================================================================
+
+// [GAP-B] warehouse_stock — Service Registry explicitly names PostgreSQL (warehouse_stock)
+// Required for GRN inward and allocation flows
+Table warehouse_stock {
+  id              uuid          [pk, default: `gen_random_uuid()`]
+  sku_id          uuid          [not null, ref: > products.id]
+  warehouse_id    varchar(100)  [not null, note: 'Warehouse identifier e.g. WH-BLR-01']
+  qty_available   integer       [not null, default: 0]
+  batch_no        varchar(100)  [null, note: 'Supplier batch number for traceability']
+  expiry          date          [null, note: 'For perishable goods; null for non-perishables']
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (sku_id, warehouse_id) [name: 'idx_warehouse_stock_sku_warehouse']
+    warehouse_id           [name: 'idx_warehouse_stock_warehouse_id']
+    expiry                 [name: 'idx_warehouse_stock_expiry', note: 'For expiry-based FIFO dispatch']
+    updated_at             [name: 'idx_warehouse_stock_updated_at']
+  }
+
+  Note: '[GAP-B FIX] Warehouse Service owner. Required for GRN (Goods Received Note) inward and store allocation flows. updated_at tracks when qty changed.'
+}
+
+
+// [GAP-B] transfers — Service Registry explicitly names PostgreSQL (transfers)
+// Required for store allocation and dispatch flows
+Table transfers {
+  id                uuid          [pk, default: `gen_random_uuid()`]
+  sku_id            uuid          [not null, ref: > products.id]
+  from_warehouse_id varchar(100)  [not null, note: 'Source warehouse identifier']
+  to_store_id       uuid          [not null, ref: > stores.id, note: 'Destination store']
+  qty               integer       [not null]
+  transfer_note     text          [null]
+  created_at        timestamptz   [not null, default: `now()`, note: 'When transfer was requested']
+  dispatched_at     timestamptz   [null, note: 'Null until warehouse dispatches; set on dispatch']
+  received_at       timestamptz   [null, note: 'Null until store confirms receipt; set on RECEIVED status. Triggers stock.qty_available increment.']
+  status            varchar(30)   [not null, default: 'PENDING', note: 'PENDING | DISPATCHED | IN_TRANSIT | RECEIVED | CANCELLED']
+
+  indexes {
+    sku_id           [name: 'idx_transfers_sku_id']
+    to_store_id      [name: 'idx_transfers_to_store_id']
+    status           [name: 'idx_transfers_status']
+    created_at       [name: 'idx_transfers_created_at']
+    dispatched_at    [name: 'idx_transfers_dispatched_at']
+    received_at      [name: 'idx_transfers_received_at']
+  }
+
+  Note: '[GAP-B FIX] Warehouse Service owner. State timestamps: created_at (requested), dispatched_at (sent), received_at (confirmed by store). On RECEIVED, stock.qty_available incremented.'
+}
+
+
+// =============================================================================

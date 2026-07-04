@@ -1,0 +1,11 @@
+{
+  "title": "Payment Gateway Health",
+  "tags": ["zippyra", "payment"],
+  "panels": [
+    { "type": "timeseries", "title": "Payment Success Rate", "targets": [{"expr": "sum(rate(payment_success_total[5m])) / sum(rate(payment_attempts_total[5m]))"}] },
+    { "type": "timeseries", "title": "Payment Failure Rate by Gateway", "targets": [{"expr": "sum by(gateway) (rate(payment_failures_total[5m])) / sum by(gateway) (rate(payment_attempts_total[5m]))"}] },
+    { "type": "timeseries", "title": "Webhook Processing Latency", "targets": [{"expr": "rate(webhook_processing_duration_seconds_sum[5m]) / rate(webhook_processing_duration_seconds_count[5m])"}] },
+    { "type": "timeseries", "title": "Circuit Breaker Status", "targets": [{"expr": "circuit_breaker_open_status"}] },
+    { "type": "timeseries", "title": "DLQ Depth for Payment Topics", "targets": [{"expr": "sum(kafka_topic_partition_current_offset{topic=~\"payment.*\\\\.dlq\"}) - sum(kafka_consumergroup_current_offset{topic=~\"payment.*\\\\.dlq\"})"}] }
+  ]
+}

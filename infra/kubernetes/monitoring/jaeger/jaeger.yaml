@@ -1,0 +1,78 @@
+---
+# Jaeger All-in-One Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+      - name: jaeger
+        image: jaegertracing/all-in-one:1.52
+        env:
+        - name: COLLECTOR_OTLP_ENABLED
+          value: "true"
+        - name: SPAN_STORAGE_TYPE
+          value: memory
+        ports:
+        - containerPort: 16686
+          name: ui
+        - containerPort: 14250
+          name: grpc-collector
+        - containerPort: 4317
+          name: otlp-grpc
+        - containerPort: 6831
+          protocol: UDP
+          name: agent
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "200m"
+            memory: "512Mi"
+
+---
+# Jaeger Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-query
+  namespace: monitoring
+spec:
+  selector:
+    app: jaeger
+  ports:
+  - name: ui
+    port: 16686
+    targetPort: 16686
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-collector
+  namespace: monitoring
+spec:
+  selector:
+    app: jaeger
+  ports:
+  - name: grpc-collector
+    port: 14250
+    targetPort: 14250
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+  - name: agent
+    port: 6831
+    protocol: UDP
+    targetPort: 6831
