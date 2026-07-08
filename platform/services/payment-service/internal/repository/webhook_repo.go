@@ -17,8 +17,11 @@ func NewWebhookRepository(db DB) *WebhookRepository {
 
 // InsertIdempotent returns (true, nil) if inserted, (false, nil) if already exists
 func (r *WebhookRepository) InsertIdempotent(ctx context.Context, w *model.WebhookEvent) (bool, error) {
-	query := "INSERT INTO payment_webhook_events (id, gateway, event_id, event_type, payload, hmac_verified, processed, created_at) VALUES ($1,$2,$3,$4,$5,$6,false,NOW()) ON CONFLICT (event_id) DO NOTHING"
-	
+	query := `
+        INSERT INTO payment_webhook_events
+            (id, gateway, event_id, event_type, payload, hmac_verified, processed, created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,false,NOW())
+        ON CONFLICT (event_id) DO NOTHING`
 	result, err := r.db.Exec(ctx, query,
 		uuid.New(), w.Gateway, w.EventID, w.EventType, w.Payload, w.HMACVerified)
 	if err != nil {

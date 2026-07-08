@@ -5,24 +5,22 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
+	"github.com/zippyra/platform/services/payment-service/internal/kafka"
 	"github.com/zippyra/platform/services/payment-service/internal/repository"
 )
 
-type OutboxProducer interface {
-	Publish(ctx context.Context, topic, key string, value interface{}) error
-}
-
 type OutboxRelay struct {
-	db       repository.DB
+	db       *pgxpool.Pool
 	repo     *repository.OutboxRepository
-	producer OutboxProducer
+	producer *kafka.Producer
 	interval time.Duration
 	backoff  time.Duration
 	maxBack  time.Duration
 }
 
-func NewOutboxRelay(db repository.DB, producer OutboxProducer) *OutboxRelay {
+func NewOutboxRelay(db *pgxpool.Pool, producer *kafka.Producer) *OutboxRelay {
 	return &OutboxRelay{
 		db:       db,
 		repo:     repository.NewOutboxRepository(db),
@@ -40,19 +38,19 @@ func (r *OutboxRelay) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
-				// Drain remaining outbox before exit
+				// drain remaining outbox before exit
 				drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				r.poll(drainCtx)
+				_ = r.poll(drainCtx)
 				return
 			case <-ticker.C:
 				if err := r.poll(ctx); err != nil {
 					log.Error().Err(err).Msg("outbox poll failed")
-					// Exponential backoff on failure
+					// exponential backoff on failure
 					time.Sleep(r.backoff)
 					r.backoff = minDuration(r.backoff*2, r.maxBack)
 				} else {
-					r.backoff = r.interval // Reset on success
+					r.backoff = r.interval // reset on success
 				}
 			}
 		}
@@ -67,7 +65,7 @@ func (r *OutboxRelay) poll(ctx context.Context) error {
 	for _, msg := range msgs {
 		if err := r.producer.Publish(ctx, msg.Topic, msg.ID, msg.Payload); err != nil {
 			log.Error().Err(err).Str("outbox_id", msg.ID).Msg("kafka publish failed")
-			continue // Skip, retry next poll
+			continue // skip, retry next poll
 		}
 		if err := r.repo.MarkPublished(ctx, msg.ID); err != nil {
 			log.Error().Err(err).Str("outbox_id", msg.ID).Msg("mark published failed")

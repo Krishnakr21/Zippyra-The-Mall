@@ -41,5 +41,7 @@ func (c *CashfreeClient) VerifyWebhookSignature(signature, timestamp, body, secr
 	return signature == expected
 }
 
-// Ensure interface compatibility
-var _ Gateway = (*CashfreeClient)(nil)
+func (c *CashfreeClient) SetHTTPClient(client *http.Client) {
+	c.client = client
+}
+

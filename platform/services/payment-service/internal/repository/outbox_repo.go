@@ -23,27 +23,31 @@ func (r *OutboxRepository) Create(ctx context.Context, tx pgx.Tx, topic string, 
 }
 
 func (r *OutboxRepository) GetUnpublished(ctx context.Context, limit int) ([]model.OutboxMessage, error) {
-	query := `SELECT id, topic, payload, created_at, published_at
+	query := `SELECT id, topic, payload, created_at
               FROM payment_outbox
               WHERE published_at IS NULL
               ORDER BY created_at ASC
               LIMIT $1`
-	
+
 	rows, err := r.db.Query(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var msgs []model.OutboxMessage
 	for rows.Next() {
 		var msg model.OutboxMessage
-		err := rows.Scan(&msg.ID, &msg.Topic, &msg.Payload, &msg.CreatedAt, &msg.PublishedAt)
-		if err != nil {
+		if err := rows.Scan(&msg.ID, &msg.Topic, &msg.Payload, &msg.CreatedAt); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, msg)
 	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
 	return msgs, nil
 }
 

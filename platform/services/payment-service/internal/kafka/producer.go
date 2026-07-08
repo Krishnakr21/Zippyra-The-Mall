@@ -8,7 +8,8 @@ import (
 )
 
 type Producer struct {
-	brokers []string
+	brokers   []string
+	PublishFn func(ctx context.Context, topic, key string, value interface{}) error
 }
 
 func NewProducer(brokers []string) *Producer {
@@ -16,6 +17,10 @@ func NewProducer(brokers []string) *Producer {
 }
 
 func (p *Producer) Publish(ctx context.Context, topic, key string, value interface{}) error {
+	if p.PublishFn != nil {
+		return p.PublishFn(ctx, topic, key, value)
+	}
+
 	w := &kafka.Writer{
 		Addr:     kafka.TCP(p.brokers...),
 		Topic:    topic,

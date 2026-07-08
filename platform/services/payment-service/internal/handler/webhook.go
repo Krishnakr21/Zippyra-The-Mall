@@ -9,68 +9,69 @@ import (
 	"github.com/zippyra/platform/services/payment-service/internal/model"
 	"github.com/zippyra/platform/services/payment-service/internal/repository"
 	"github.com/zippyra/platform/services/payment-service/internal/service"
+	errors "github.com/zippyra/platform/shared/errors"
 )
 
 type WebhookHandler struct {
-	svc         *service.PaymentService
-	webhookRepo *repository.WebhookRepository
-	rzpSecret   string
-	cfSecret    string
+	svc           *service.PaymentService
+	webhookRepo   *repository.WebhookRepository
+	razorpay      *service.RazorpayClient
+	webhookSecret string
+	cfSecret      string
 }
 
 func NewWebhookHandler(svc *service.PaymentService, webhookRepo *repository.WebhookRepository, rzpSecret, cfSecret string) *WebhookHandler {
 	return &WebhookHandler{
-		svc:         svc,
-		webhookRepo: webhookRepo,
-		rzpSecret:   rzpSecret,
-		cfSecret:    cfSecret,
+		svc:           svc,
+		webhookRepo:   webhookRepo,
+		razorpay:      service.NewRazorpayClient("", ""),
+		webhookSecret: rzpSecret,
+		cfSecret:      cfSecret,
 	}
 }
 
 func (h *WebhookHandler) Razorpay(w http.ResponseWriter, r *http.Request) {
-	// LIMIT BODY: 1MB max for webhooks
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1024*1024))
+	// Step 1: Read body with 1MB limit
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1*1024*1024))
 	if err != nil {
-		http.Error(w, "too large", http.StatusRequestEntityTooLarge)
+		errors.WriteError(w, 400, errors.ErrRequestTooLarge, "body too large", "")
 		return
 	}
 
-	// 1. Signature Verification FIRST (Security)
-	signature := r.Header.Get("X-Razorpay-Signature")
-	rzp := service.NewRazorpayClient("", "") // Just for verification logic
-	if !rzp.VerifyWebhookSignature(body, signature, h.rzpSecret) {
-		log.Warn().Msg("Invalid Razorpay Signature")
-		w.WriteHeader(http.StatusUnauthorized)
+	// Step 2: HMAC verification FIRST — before any DB operation
+	sig := r.Header.Get("X-Razorpay-Signature")
+	if !h.razorpay.VerifyWebhookSignature(body, sig, h.webhookSecret) {
+		log.Warn().Str("ip", r.RemoteAddr).Msg("invalid razorpay webhook signature")
+		errors.WriteError(w, 400, errors.ErrWebhookInvalidSignature, "invalid signature", "")
 		return
 	}
 
-	// 2. Fast Parse
+	// Step 3: Parse payload
 	var event model.RazorpayWebhookEvent
 	if err := json.Unmarshal(body, &event); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		errors.WriteError(w, 400, errors.ErrValidationFailed, "invalid payload", "")
 		return
 	}
 
-	// 3. Idempotency Check (DB)
-	wEvent := &model.WebhookEvent{
+	// Step 4: Idempotency check
+	inserted, err := h.webhookRepo.InsertIdempotent(r.Context(), &model.WebhookEvent{
 		Gateway:      "RAZORPAY",
 		EventID:      event.EventID,
 		EventType:    event.Event,
 		Payload:      body,
 		HMACVerified: true,
-	}
-	inserted, err := h.webhookRepo.InsertIdempotent(r.Context(), wEvent)
+	})
 	if err != nil {
-		log.Error().Err(err).Msg("webhook idempotency check failed")
-		w.WriteHeader(http.StatusInternalServerError)
+		errors.WriteInternalError(w, "")
 		return
 	}
 	if !inserted {
-		w.WriteHeader(http.StatusOK) // Already processed
+		// already processed — return 200 immediately
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// 4. Process Event logic
+	// Step 5: Process event
 	var processErr error
 	switch event.Event {
 	case "payment.captured":
@@ -79,55 +80,59 @@ func (h *WebhookHandler) Razorpay(w http.ResponseWriter, r *http.Request) {
 		processErr = h.svc.HandlePaymentFailed(r.Context(), event)
 	case "payment.authorized":
 		processErr = h.svc.HandlePaymentAuthorized(r.Context(), event)
+	default:
+		log.Info().Str("event", event.Event).Msg("unhandled razorpay event")
 	}
 
-	// 5. Finalize status
+	// Step 6: Mark processed
 	errMsg := ""
 	if processErr != nil {
+		log.Error().Err(processErr).Msg("webhook processing failed")
 		errMsg = processErr.Error()
-		log.Error().Err(processErr).Str("event_id", event.EventID).Msg("processing failed")
 	}
 	h.webhookRepo.MarkProcessed(r.Context(), event.EventID, errMsg)
 
-	// Always return 200 OK to gateway after logging error
+	// Must respond within 200ms
 	w.WriteHeader(http.StatusOK)
 }
 
 func (h *WebhookHandler) Cashfree(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1024*1024))
+	// Step 1: Read body with 1MB limit
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1*1024*1024))
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		errors.WriteError(w, 400, errors.ErrRequestTooLarge, "body too large", "")
 		return
 	}
 
-	signature := r.Header.Get("x-webhook-signature")
-	timestamp := r.Header.Get("x-webhook-timestamp")
-	
+	// Step 2: HMAC verification FIRST — before any DB operation
+	sig := r.Header.Get("x-webhook-signature")
+	ts := r.Header.Get("x-webhook-timestamp")
+
 	cf := service.NewCashfreeClient("", "")
-	if !cf.VerifyWebhookSignature(signature, timestamp, string(body), h.cfSecret) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if !cf.VerifyWebhookSignature(sig, ts, string(body), h.cfSecret) {
+		log.Warn().Str("ip", r.RemoteAddr).Msg("invalid cashfree webhook signature")
+		errors.WriteError(w, 400, errors.ErrWebhookInvalidSignature, "invalid signature", "")
 		return
 	}
 
-	// 2. Fast Parse
+	// Step 3: Parse payload
 	var event model.CashfreeWebhookEvent
 	if err := json.Unmarshal(body, &event); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		errors.WriteError(w, 400, errors.ErrValidationFailed, "invalid payload", "")
 		return
 	}
 
-	// 3. Idempotency Check
-	wEvent := &model.WebhookEvent{
+	// Step 4: Idempotency check
+	eventID := event.Data.Order.OrderID + "_" + event.Data.Payment.PaymentStatus
+	inserted, err := h.webhookRepo.InsertIdempotent(r.Context(), &model.WebhookEvent{
 		Gateway:      "CASHFREE",
-		EventID:      event.Data.Order.OrderID + "_" + event.Data.Payment.PaymentStatus, // CF doesn't provide unique event ID in common fields
+		EventID:      eventID,
 		EventType:    event.EventType,
 		Payload:      body,
 		HMACVerified: true,
-	}
-	inserted, err := h.webhookRepo.InsertIdempotent(r.Context(), wEvent)
+	})
 	if err != nil {
-		log.Error().Err(err).Msg("webhook idempotency check failed")
-		w.WriteHeader(http.StatusInternalServerError)
+		errors.WriteInternalError(w, "")
 		return
 	}
 	if !inserted {
@@ -135,27 +140,19 @@ func (h *WebhookHandler) Cashfree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Process Logic
+	// Step 5: Process event
 	var processErr error
-	if event.EventType == "PAYMENT_SUCCESS_WEBHOOK" {
-		// Adapt CF event to a format service can handle
-		// For now, we reuse the same logic if possible or implement a generic one
-		// Since we need 100% coverage, let's call a service method that exists
-		razorEvent := model.RazorpayWebhookEvent{}
-		razorEvent.Payload.Payment.Entity.Status = "captured"
-		razorEvent.Payload.Payment.Entity.Notes.PaymentID = event.Data.Order.OrderID
-		razorEvent.Payload.Payment.Entity.ID = event.Data.Payment.CfPaymentID
-		
-		processErr = h.svc.HandlePaymentCaptured(r.Context(), razorEvent)
+	if event.EventType == "PAYMENT_SUCCESS_WEBHOOK" || event.EventType == "PAYMENT_FAILED_WEBHOOK" {
+		processErr = h.svc.HandleCashfreeWebhook(r.Context(), event)
 	}
 
-	// 5. Cleanup
+	// Step 6: Mark processed
 	errMsg := ""
 	if processErr != nil {
 		log.Error().Err(processErr).Msg("webhook processing failed")
 		errMsg = processErr.Error()
 	}
-	h.webhookRepo.MarkProcessed(r.Context(), wEvent.EventID, errMsg)
+	h.webhookRepo.MarkProcessed(r.Context(), eventID, errMsg)
 
 	w.WriteHeader(http.StatusOK)
 }
