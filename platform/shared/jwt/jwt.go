@@ -140,3 +140,27 @@ func IsBlacklisted(ctx context.Context, client redis.Cmdable, jti string) (bool,
 	}
 	return res == 1, nil
 }
+
+type ExitTokenClaims struct {
+	OrderID string `json:"order_id"`
+	UserID  string `json:"user_id"`
+	StoreID string `json:"store_id"`
+	jwt.RegisteredClaims
+}
+
+func GenerateExitToken(claims ExitTokenClaims) (string, error) {
+	now := time.Now()
+	claims.RegisteredClaims = jwt.RegisteredClaims{
+		ExpiresAt: jwt.NewNumericDate(now.Add(10 * time.Minute)),
+		IssuedAt:  jwt.NewNumericDate(now),
+		ID:        generateJTI(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
+	signed, err := token.SignedString(privateKey)
+	if err != nil {
+		return "", fmt.Errorf("jwt: failed to sign exit token: %w", err)
+	}
+	return signed, nil
+}
+
