@@ -1,8 +1,13 @@
 FROM golang:1.22-alpine AS builder
 WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /exit-validation-service ./cmd/server
-FROM alpine:3.19
-COPY --from=builder /exit-validation-service /exit-validation-service
-EXPOSE 8009
-CMD ["/exit-validation-service"]
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-w -s" -o exit-validation-service ./cmd/server/
+
+FROM scratch
+COPY --from=builder /app/exit-validation-service .
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+EXPOSE 8088
+ENTRYPOINT ["./exit-validation-service"]
